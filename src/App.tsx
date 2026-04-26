@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import * as XLSX from 'xlsx';
 import Papa from 'papaparse';
 import { 
@@ -19,7 +19,8 @@ import { motion, AnimatePresence } from 'motion/react';
 import { auth, db, handleFirestoreError, OperationType } from './firebase';
 import { 
   collection, query, where, orderBy, limit, getDocs, 
-  addDoc, writeBatch, doc, setDoc, onSnapshot, getDocFromServer
+  addDoc, writeBatch, doc, setDoc, onSnapshot, getDocFromServer,
+  getCountFromServer
 } from 'firebase/firestore';
 import { GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged } from 'firebase/auth';
 
@@ -269,33 +270,33 @@ export default function App() {
 
   // Sync date range with available data bounds
   useEffect(() => {
-    if (dataBounds.start && dataBounds.end) {
-      let newStart = dateRange.start;
-      let newEnd = dateRange.end;
-      let changed = false;
+    if (!dataBounds.start || !dataBounds.end) return;
 
-      if (!newStart || newStart < dataBounds.start) {
-        newStart = dataBounds.start;
-        changed = true;
-      }
-      if (!newEnd || newEnd > dataBounds.end) {
-        newEnd = dataBounds.end;
+    setDateRange(prev => {
+      let changed = false;
+      let s = prev.start;
+      let e = prev.end;
+
+      // Handle initialization or out of bound values
+      if (!s || s < dataBounds.start) { s = dataBounds.start; changed = true; }
+      if (s > dataBounds.end) { s = dataBounds.end; changed = true; }
+      if (!e || e > dataBounds.end) { e = dataBounds.end; changed = true; }
+      if (e < dataBounds.start) { e = dataBounds.end; changed = true; }
+      
+      // Safety: logical order
+      if (s > e) {
+        if (s === prev.start) e = s;
+        else s = e;
         changed = true;
       }
 
       if (changed) {
-        console.log("Enforcing data bounds:", { start: newStart, end: newEnd });
-        setDateRange({ start: newStart, end: newEnd });
-        
-        // Show notification ONLY if it wasn't a "fresh" load (i.e. if user had something else in mind)
-        const saved = localStorage.getItem('bt_date_range');
-        if (saved) {
-           setNotification({ message: `Range adjusted to available data: ${new Date(dataBounds.start).toLocaleDateString()} to ${new Date(dataBounds.end).toLocaleDateString()}`, type: 'info' });
-           setTimeout(() => setNotification(null), 5000);
-        }
+        console.log("Auto-clamping date range to bounds:", { start: s, end: e }, "Bounds:", dataBounds);
       }
-    }
-  }, [dataBounds]);
+
+      return changed ? { start: s, end: e } : prev;
+    });
+  }, [dataBounds]); // Only re-run when bounds change (e.g. source switch or data load)
 
   const [strategy, setStrategy] = useState<Strategy>(() => {
     const saved = localStorage.getItem('bt_strategy');
@@ -313,6 +314,11 @@ export default function App() {
   const [isSaving, setIsSaving] = useState(false);
   const [showOverwriteModal, setShowOverwriteModal] = useState(false);
   const [pendingImportData, setPendingImportData] = useState<{data: OHLCData[], fileName: string} | null>(null);
+  const [sidebarTab, setSidebarTab] = useState<'STRATEGY' | 'DATA'>('STRATEGY');
+  const [dbStats, setDbStats] = useState<{ start: string; end: string; columns: string[]; totalRecords: number } | null>(null);
+  const [checkingDb, setCheckingDb] = useState(false);
+  const [resettingDb, setResettingDb] = useState(false);
+  const [dbLoadingProgress, setDbLoadingProgress] = useState<{ current: number; total: number } | null>(null);
   const [uploadStatus, setUploadStatus] = useState<UploadStatus>({
     isUploading: false,
     processedFiles: 0,
@@ -345,11 +351,19 @@ export default function App() {
   useEffect(() => {
     return onAuthStateChanged(auth, (u) => {
       setUser(u);
-      if (u && dataSource === 'DB') {
-        loadDataFromFirestore();
+      if (u) {
+        // Attempt to connect to DB on mount/login to verify status
+        loadDataFromFirestore(1000); // Small initial load
       }
     });
-  }, [dataSource]);
+  }, []); // Run on mount to check connectivity and set default status
+
+  // Reload data when date range changes and using DB
+  useEffect(() => {
+    if (user && dataSource === 'DB' && dateRange.start && dateRange.end) {
+       loadDataFromFirestore(10000); // Load more if range specified
+    }
+  }, [dateRange.start, dateRange.end]);
 
   const handleLogin = async () => {
     const provider = new GoogleAuthProvider();
@@ -363,40 +377,163 @@ export default function App() {
   const handleLogout = async () => {
     await signOut(auth);
     setData([]);
+    setDataBounds({ start: '', end: '' });
     setDataSource('SIMULATED');
     localStorage.removeItem('bt_date_range');
   };
 
-  const loadDataFromFirestore = async () => {
-    if (!user) return;
-    setDbError(null);
+  const resetInputRef = useRef<HTMLInputElement>(null);
+
+  const handleResetAndUploadTrigger = () => {
+    console.log("Reset & Upload Clicked", { 
+      hasUser: !!user, 
+      resettingDb, 
+      isBacktesting,
+      hasRef: !!resetInputRef.current 
+    });
+
+    if (!user) {
+      setNotification({ message: "Please sign in to reset data", type: 'error' });
+      return;
+    }
+    
+    if (isBacktesting) {
+      setNotification({ message: "Cannot reset while backtest is in progress", type: 'warning' });
+      return;
+    }
+
+    if (window.confirm("ARE YOU SURE? This will PERMANENTLY DELETE all your data from the cloud before uploading new files. Continue?")) {
+      if (resetInputRef.current) {
+        console.log("Triggering directory picker...");
+        resetInputRef.current.click();
+      } else {
+        console.error("Reset input ref is missing!");
+        setNotification({ message: "System Error: Input element not ready", type: 'error' });
+      }
+    }
+  };
+
+  const handleResetAndUploadFiles = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files;
+    console.log("Files selected for Reset & Upload:", files?.length || 0);
+    if (!files || files.length === 0 || !user) return;
+
+    setResettingDb(true);
+    setNotification({ message: "Beggining Database Wipe...", type: 'info' });
+
     try {
-      console.log("Connecting to Database...");
-      // Test connection with getDocFromServer as per best practices
-      const testDocRef = doc(db, 'ohlc_data', 'ping'); // dummy doc
-      try {
-        await getDocFromServer(testDocRef);
-      } catch (e: any) {
-        // Even if doc doesn't exist, if it returns, it connected. 
-        // If it throws "offline", it failed.
-        if (e.message?.includes('offline')) throw e;
+      let deletedCount = 0;
+      // Faster deletion check
+      const qCheck = query(collection(db, 'ohlc_data'), where('userId', '==', user.uid), limit(1));
+      const checkSnap = await getDocs(qCheck);
+      
+      if (!checkSnap.empty) {
+        while (true) {
+          const q = query(collection(db, 'ohlc_data'), where('userId', '==', user.uid), limit(500));
+          const snap = await getDocs(q);
+          if (snap.empty) break;
+
+          const batch = writeBatch(db);
+          snap.docs.forEach(d => batch.delete(d.ref));
+          await batch.commit();
+          deletedCount += snap.size;
+          setNotification({ message: `Wiped ${deletedCount} records...`, type: 'info' });
+        }
+      }
+      
+      console.log(`Wiped ${deletedCount} docs total.`);
+      setNotification({ message: "Wipe Complete. Starting upload...", type: 'success' });
+
+      await processFilesAndUpload(files);
+      
+    } catch (e: any) {
+      console.error("Reset & Upload Failed:", e);
+      setNotification({ message: "Error during reset/upload process", type: 'error' });
+    } finally {
+      setResettingDb(false);
+      if (event.target) event.target.value = '';
+    }
+  };
+
+  const handleDataCheck = async () => {
+    if (!user) {
+      setNotification({ message: "Please sign in to check database", type: 'error' });
+      return;
+    }
+    setCheckingDb(true);
+    setDbError(null);
+    const path = 'ohlc_data';
+    try {
+      console.log("Starting Database Inspector...");
+      
+      const qMin = query(collection(db, path), where('userId', '==', user.uid), orderBy('time', 'asc'), limit(1));
+      const qMax = query(collection(db, path), where('userId', '==', user.uid), orderBy('time', 'desc'), limit(1));
+      const qCount = query(collection(db, path), where('userId', '==', user.uid));
+      
+      const [snapMin, snapMax, totalCountSnap] = await Promise.all([
+        getDocs(qMin).catch(err => { handleFirestoreError(err, OperationType.GET, `${path} (min query)`); throw err; }),
+        getDocs(qMax).catch(err => { handleFirestoreError(err, OperationType.GET, `${path} (max query)`); throw err; }),
+        getCountFromServer(qCount).catch(err => { handleFirestoreError(err, OperationType.GET, `${path} (count)`); throw err; })
+      ]);
+      
+      if (snapMin.empty) {
+        setDbStats({ start: 'N/A', end: 'N/A', columns: [], totalRecords: 0 });
+        setNotification({ message: "No data found for your account", type: 'info' });
+        return;
       }
 
-      // 1. First find the absolute bounds for this user
-      const qMin = query(collection(db, 'ohlc_data'), where('userId', '==', user.uid), orderBy('time', 'asc'), limit(1));
-      const qMax = query(collection(db, 'ohlc_data'), where('userId', '==', user.uid), orderBy('time', 'desc'), limit(1));
+      const rawStart = snapMin.docs[0].data().time;
+      const rawEnd = snapMax.docs[0].data().time;
       
-      const [snapMin, snapMax] = await Promise.all([getDocs(qMin), getDocs(qMax)]);
+      const allFields = Object.keys(snapMin.docs[0].data());
+      const filteredColumns = allFields.filter(k => !['userId', 'datasetId'].includes(k));
+
+      setDbStats({
+        start: new Date(rawStart).toLocaleString(),
+        end: new Date(rawEnd).toLocaleString(),
+        columns: filteredColumns.sort(),
+        totalRecords: totalCountSnap.data().count
+      });
+
+      // Sync the date range boundaries
+      const startDate = rawStart.split('T')[0];
+      const endDate = rawEnd.split('T')[0];
+      setDataBounds({ start: startDate, end: endDate });
+
+    } catch (e: any) {
+      console.error("Data Check Technical Details:", e);
+      let userMsg = "Data check failed. Enable index in Firebase console if prompted.";
+      if (e.message?.includes('index')) {
+        userMsg = "Firestore Index Required. Check console for link to enable.";
+      }
+      setDbError(userMsg);
+      setNotification({ message: "Database Check Failed", type: 'error' });
+    } finally {
+      setCheckingDb(false);
+    }
+  };
+
+  const loadDataFromFirestore = async (limitCount: number = 5000) => {
+    if (!user) return;
+    setDbError(null);
+    setCheckingDb(true);
+    const path = 'ohlc_data';
+    try {
+      console.log(`Connecting to Database... (Loading up to ${limitCount} bars)`);
+      
+      const qMin = query(collection(db, path), where('userId', '==', user.uid), orderBy('time', 'asc'), limit(1));
+      const qMax = query(collection(db, path), where('userId', '==', user.uid), orderBy('time', 'desc'), limit(1));
+      
+      const [snapMin, snapMax] = await Promise.all([
+        getDocs(qMin).catch(err => { handleFirestoreError(err, OperationType.GET, `${path} (min)`); throw err; }),
+        getDocs(qMax).catch(err => { handleFirestoreError(err, OperationType.GET, `${path} (max)`); throw err; })
+      ]);
       
       let dbStart = '';
       let dbEnd = '';
       
-      if (!snapMin.empty) {
-        dbStart = snapMin.docs[0].data().time;
-      }
-      if (!snapMax.empty) {
-        dbEnd = snapMax.docs[0].data().time;
-      }
+      if (!snapMin.empty) dbStart = snapMin.docs[0].data().time;
+      if (!snapMax.empty) dbEnd = snapMax.docs[0].data().time;
 
       const startDate = (dbStart || '').split('T')[0];
       const endDate = (dbEnd || '').split('T')[0];
@@ -407,28 +544,53 @@ export default function App() {
       } else {
         console.log("Database connected but empty. Defaulting to Simulated.");
         setDataSource('SIMULATED');
+        setCheckingDb(false);
         return;
       }
 
-      // 2. Load the most recent chunk of data
-      const q = query(collection(db, 'ohlc_data'), where('userId', '==', user.uid), orderBy('time', 'desc'), limit(2000));
-      const querySnapshot = await getDocs(q);
+      // 2. Load data - prefer specific range if set, otherwise latest
+      let q;
+      if (dateRange.start && dateRange.end) {
+        const startIso = new Date(dateRange.start).toISOString();
+        const endIso = new Date(dateRange.end + 'T23:59:59').toISOString();
+        q = query(
+          collection(db, path), 
+          where('userId', '==', user.uid), 
+          where('time', '>=', startIso),
+          where('time', '<=', endIso),
+          orderBy('time', 'asc')
+        );
+      } else {
+        q = query(collection(db, path), where('userId', '==', user.uid), orderBy('time', 'desc'), limit(limitCount));
+      }
+
+      const querySnapshot = await getDocs(q).catch(err => { handleFirestoreError(err, OperationType.GET, path); throw err; });
       const loadedData: OHLCData[] = [];
       querySnapshot.forEach((doc) => {
-        loadedData.push(doc.data() as OHLCData);
+        const d = doc.data() as OHLCData;
+        loadedData.push(d);
       });
       
       if (loadedData.length > 0) {
         const sortedLoaded = loadedData.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
         setData(sortedLoaded);
-        console.log(`DB Sync Complete. Bounds: ${startDate} to ${endDate}`);
+        console.log(`DB Sync Complete. Loaded ${loadedData.length} bars.`);
+      } else if (dateRange.start) {
+        setNotification({ message: "No data found for selected range", type: 'warning' });
+        setTimeout(() => setNotification(null), 5000);
       }
     } catch (e: any) {
       console.error("Database Connection Failed:", e);
-      setDbError("Database unreachable. Switched to Simulated mode.");
+      let userMsg = "Database Connection Failed.";
+      if (e.message?.includes('index')) {
+        userMsg = "Firestore Index Required. Check console for link.";
+      }
+      setDbError(userMsg);
       setDataSource('SIMULATED');
-      setNotification({ message: "DB Connection Failed - Using Simulated Data", type: 'error' });
+      setNotification({ message: userMsg, type: 'error' });
       setTimeout(() => setNotification(null), 6000);
+    } finally {
+      setCheckingDb(false);
     }
   };
 
@@ -645,14 +807,13 @@ export default function App() {
     }));
   }, [filteredData, strategy.candleType, strategy.brickSize]);
 
-  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const files = event.target.files;
+  const processFilesAndUpload = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
 
     const allData: OHLCData[] = [];
-    const fileArray = Array.from(files as FileList).filter((f: File) => 
-      f.name.endsWith('.csv') || f.name.endsWith('.xlsx') || f.name.endsWith('.xls')
-    );
+    const fileArray = Array.from(files as FileList)
+      .filter((f: File) => f.name.endsWith('.csv') || f.name.endsWith('.xlsx') || f.name.endsWith('.xls'))
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
     
     setIsBacktesting(true);
     setUploadStatus({
@@ -685,21 +846,29 @@ export default function App() {
                     // Try different date formats
                     let date = new Date(rawTime);
                     
-                    // If simple Date fails, try common Indian/Custom formats if needed
-                    // Actually standard ISO or most common strings work with new Date()
-                    if (isNaN(date.getTime())) {
-                        // Try splitting if it's like DD-MM-YYYY
-                        if (typeof rawTime === 'string' && rawTime.includes('-')) {
-                            const parts = rawTime.split(/[- :]/);
-                            if (parts[0].length === 2) { // DD-MM-YYYY
-                                date = new Date(`${parts[2]}-${parts[1]}-${parts[0]}T${parts[3] || '00'}:${parts[4] || '00'}:00`);
-                            }
+                    if (isNaN(date.getTime()) && typeof rawTime === 'string') {
+                        // Format: DD-MM-YYYY or DD/MM/YYYY
+                        const parts = rawTime.split(/[- /:T]/);
+                        if (parts.length >= 3) {
+                          if (parts[0].length === 2 && parts[1].length === 2 && parts[2].length === 4) {
+                             // DD-MM-YYYY
+                             date = new Date(`${parts[2]}-${parts[1]}-${parts[0]}T${parts[3] || '00'}:${parts[4] || '00'}:00`);
+                          } else if (parts[0].length === 4 && parts[1].length === 2 && parts[2].length === 2) {
+                             // YYYY-MM-DD
+                             date = new Date(`${parts[0]}-${parts[1]}-${parts[2]}T${parts[3] || '00'}:${parts[4] || '00'}:00`);
+                          } else if (parts[0].length === 8) {
+                             // YYYYMMDD
+                             const y = parts[0].substring(0, 4);
+                             const m = parts[0].substring(4, 6);
+                             const dStr = parts[0].substring(6, 8);
+                             date = new Date(`${y}-${m}-${dStr}T00:00:00`);
+                          }
                         }
                     }
 
                     if (isNaN(date.getTime())) {
-                      console.warn(`Invalid date format for file ${file.name}: ${rawTime}`);
-                      return null;
+                       console.warn(`Invalid date format for file ${file.name}: ${rawTime}`);
+                       return null;
                     }
 
                     const open = parseFloat(String(d.open || d.Open || '').replace(/,/g, ''));
@@ -717,6 +886,10 @@ export default function App() {
                   })
                   .filter((d: any): d is OHLCData => d !== null);
                 resolve(parsed);
+              },
+              error: (err) => {
+                console.error("CSV Parse Error", err);
+                resolve([]);
               }
             });
           });
@@ -724,36 +897,54 @@ export default function App() {
           // Handle Excel files
           fileData = await new Promise<OHLCData[]>((resolve) => {
             const reader = new FileReader();
+            reader.onerror = () => resolve([]);
             reader.onload = (e) => {
-              const data = new Uint8Array(e.target?.result as ArrayBuffer);
-              const workbook = XLSX.read(data, { type: 'array' });
-              const firstSheetName = workbook.SheetNames[0];
-              const worksheet = workbook.Sheets[firstSheetName];
-              const jsonData = XLSX.utils.sheet_to_json(worksheet) as any[];
-              
-              const parsed = jsonData
-                .map((d: any) => {
-                  const rawTime = d.time || d.Time || d.Date || d.date || d.Timestamp || d.timestamp || d.DateTime || d.datetime;
-                  if (!rawTime) return null;
-                  let date = new Date(rawTime);
-                  
-                  if (isNaN(date.getTime())) return null;
+              try {
+                const data = new Uint8Array(e.target?.result as ArrayBuffer);
+                const workbook = XLSX.read(data, { type: 'array', cellDates: true });
+                const firstSheetName = workbook.SheetNames[0];
+                const worksheet = workbook.Sheets[firstSheetName];
+                const jsonData = XLSX.utils.sheet_to_json(worksheet, { defval: "" }) as any[];
+                
+                const parsed = jsonData
+                  .map((d: any) => {
+                    const rawTime = d.time || d.Time || d.Date || d.date || d.Timestamp || d.timestamp || d.DateTime || d.datetime;
+                    if (!rawTime) return null;
+                    
+                    let date = new Date(rawTime);
+                    
+                    if (isNaN(date.getTime()) && typeof rawTime === 'string') {
+                        const parts = rawTime.split(/[- /:T]/);
+                        if (parts.length >= 3) {
+                          if (parts[0].length === 2 && parts[1].length === 2 && parts[2].length === 4) {
+                             date = new Date(`${parts[2]}-${parts[1]}-${parts[0]}T${parts[3] || '00'}:${parts[4] || '00'}:00`);
+                          } else if (parts[0].length === 4 && parts[1].length === 2 && parts[2].length === 2) {
+                             date = new Date(`${parts[0]}-${parts[1]}-${parts[2]}T${parts[3] || '00'}:${parts[4] || '00'}:00`);
+                          }
+                        }
+                    }
 
-                  const open = parseFloat(String(d.open || d.Open || '').replace(/,/g, ''));
-                  const close = parseFloat(String(d.close || d.Close || '').replace(/,/g, ''));
-                  if (isNaN(open) || isNaN(close)) return null;
+                    if (isNaN(date.getTime())) return null;
 
-                  return {
-                    time: date.toISOString(),
-                    open,
-                    high: parseFloat(String(d.high || d.High || d.open || d.Open || '').replace(/,/g, '')),
-                    low: parseFloat(String(d.low || d.Low || d.close || d.Close || '').replace(/,/g, '')),
-                    close,
-                    volume: parseFloat(String(d.volume || d.Volume || 0).replace(/,/g, ''))
-                  };
-                })
-                .filter((d: any): d is OHLCData => d !== null);
-              resolve(parsed);
+                    const open = parseFloat(String(d.open || d.Open || '').replace(/,/g, ''));
+                    const close = parseFloat(String(d.close || d.Close || '').replace(/,/g, ''));
+                    if (isNaN(open) || isNaN(close)) return null;
+
+                    return {
+                      time: date.toISOString(),
+                      open,
+                      high: parseFloat(String(d.high || d.High || d.open || d.Open || '').replace(/,/g, '')),
+                      low: parseFloat(String(d.low || d.Low || d.close || d.Close || '').replace(/,/g, '')),
+                      close,
+                      volume: parseFloat(String(d.volume || d.Volume || 0).replace(/,/g, ''))
+                    };
+                  })
+                  .filter((d: any): d is OHLCData => d !== null);
+                resolve(parsed);
+              } catch (err) {
+                console.error("Excel parse error", err);
+                resolve([]);
+              }
             };
             reader.readAsArrayBuffer(file);
           });
@@ -762,48 +953,69 @@ export default function App() {
         console.error(`Error parsing file ${file.name}`, err);
       }
       
+      // Update progress even if fileData is empty
+      setUploadStatus(prev => {
+        let range = prev.currentDateRange;
+        if (fileData.length > 0) {
+          const s = fileData[0].time.split('T')[0];
+          const e = fileData[fileData.length - 1].time.split('T')[0];
+          range = `${s} to ${e}`;
+        }
+        return { 
+          ...prev, 
+          processedFiles: i + 1, 
+          currentDateRange: range,
+          progress: Math.floor(((i + 1) / fileArray.length) * 100) 
+        };
+      });
+
       if (fileData.length > 0) {
         allData.push(...fileData);
-        if (user) {
-          await checkDuplicatesAndSave(fileData, file.name);
+      }
+      
+      // Let the main thread breathe between files
+      if (i % 2 === 0) {
+        await new Promise(r => setTimeout(r, 0));
+      }
+    }
+
+    if (allData.length > 0) {
+      setUploadStatus(prev => ({ ...prev, currentDateRange: 'Sorting & De-duplicating...', progress: 99 }));
+      await new Promise(r => setTimeout(r, 50));
+
+      // Sort and Deduplicate the entire batch
+      const sortedBatch = allData.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+      const uniqueData: OHLCData[] = [];
+      const seenTimes = new Set<string>();
+      for (const d of sortedBatch) {
+        if (!seenTimes.has(d.time)) {
+          uniqueData.push(d);
+          seenTimes.add(d.time);
         }
       }
-    }
 
-    // Combine with existing data if any
-    const finalData = dataSource === 'SIMULATED' ? allData : [...data, ...allData];
-
-    // Sort combined data by time and remove duplicates
-    const sortedData = finalData.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
-    
-    // De-duplicate by timestamp
-    const uniqueData: OHLCData[] = [];
-    const seenTimes = new Set<string>();
-    for (const d of sortedData) {
-      if (!seenTimes.has(d.time)) {
-        uniqueData.push(d);
-        seenTimes.add(d.time);
-      }
-    }
-    
-    if (uniqueData.length > 0) {
+      console.log(`Prepared ${uniqueData.length} bars for upload/display.`);
+      
+      // Update UI state immediately with new available data
       setData(uniqueData);
       setDataSource('FILES');
       
       const start = uniqueData[0].time.split('T')[0];
       const end = uniqueData[uniqueData.length - 1].time.split('T')[0];
       setDataBounds({ start, end });
-      
-      // Auto-populate date range
-      try {
-        setDateRange({ start, end });
-        console.log(`Successfully merged ${uniqueData.length} bars. Full Range: ${start} to ${end}`);
-      } catch (e) {
-        console.error("Date range auto-population failed", e);
+      setDateRange({ start, end });
+
+      // Save to DB if user active
+      if (user) {
+        await checkDuplicatesAndSave(uniqueData, `${fileArray.length} files folder`);
       }
     }
     setIsBacktesting(false);
-    setUploadStatus(prev => ({ ...prev, isUploading: false }));
+    setUploadStatus(prev => ({ ...prev, isUploading: false, progress: 100 }));
+  };
+
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    await processFilesAndUpload(event.target.files);
   };
 
   const handleRunBacktest = () => {
@@ -834,8 +1046,34 @@ export default function App() {
           <h1 className="text-emerald-500 font-bold text-xs uppercase tracking-widest">Nifty Backtest Pro</h1>
         </div>
         
-        <div className="flex-1 overflow-y-auto p-4 space-y-6 custom-scrollbar">
-          <div className="space-y-4">
+        {/* Tab Switcher */}
+        <div className="flex border-b border-slate-800 bg-slate-900/20 shrink-0">
+          <button 
+            onClick={() => setSidebarTab('STRATEGY')}
+            className={cn(
+              "flex-1 py-3 text-[10px] font-bold uppercase tracking-widest transition-all relative",
+              sidebarTab === 'STRATEGY' ? "text-emerald-500" : "text-slate-500 hover:text-slate-300"
+            )}
+          >
+            Strategy
+            {sidebarTab === 'STRATEGY' && <motion.div layoutId="sidebarTab" className="absolute bottom-0 left-0 right-0 h-0.5 bg-emerald-500" />}
+          </button>
+          <button 
+            onClick={() => setSidebarTab('DATA')}
+            className={cn(
+              "flex-1 py-3 text-[10px] font-bold uppercase tracking-widest transition-all relative",
+              sidebarTab === 'DATA' ? "text-blue-500" : "text-slate-500 hover:text-slate-300"
+            )}
+          >
+            Data
+            {sidebarTab === 'DATA' && <motion.div layoutId="sidebarTab" className="absolute bottom-0 left-0 right-0 h-0.5 bg-blue-500" />}
+          </button>
+        </div>
+        
+        <div className="flex-1 overflow-y-auto p-4 custom-scrollbar">
+          {sidebarTab === 'STRATEGY' ? (
+            <div className="space-y-6">
+              <div className="space-y-4">
             <div>
               <label className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">Load Preset</label>
               <select 
@@ -1083,35 +1321,133 @@ export default function App() {
             </div>
           </div>
 
-          <div className="space-y-3 pt-6">
-            <button 
-              onClick={handleRunBacktest}
-              disabled={isBacktesting}
-              className={cn(
-                "w-full py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded transition-all uppercase tracking-tight shadow-lg shadow-emerald-900/20 flex items-center justify-center gap-2",
-                isBacktesting && "opacity-50 cursor-not-allowed"
+              <div className="space-y-3 pt-6">
+                <button 
+                  onClick={handleRunBacktest}
+                  disabled={isBacktesting}
+                  className={cn(
+                    "w-full py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded transition-all uppercase tracking-tight shadow-lg shadow-emerald-900/20 flex items-center justify-center gap-2",
+                    isBacktesting && "opacity-50 cursor-not-allowed"
+                  )}
+                >
+                  {isBacktesting ? <div className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <Play size={12} fill="currentColor" />}
+                  Execute Backtest
+                </button>
+                
+                <button 
+                  onClick={() => setShowFormulaModal(true)}
+                  className="w-full py-2 border border-slate-700 hover:bg-slate-800 text-slate-400 hover:text-blue-400 text-xs font-bold rounded transition-all uppercase tracking-tight flex items-center justify-center gap-2"
+                >
+                  <Code2 size={12} />
+                  Formula transparency
+                </button>
+                <button 
+                  onClick={handleAIOptimize}
+                  disabled={!backtestResult || isOptimizing}
+                  className="w-full py-2 border border-slate-700 hover:bg-slate-800 text-slate-400 hover:text-emerald-400 text-xs font-bold rounded transition-all uppercase tracking-tight flex items-center justify-center gap-2"
+                >
+                  {isOptimizing ? <div className="w-3 h-3 border-2 border-emerald-500/30 border-t-emerald-500 rounded-full animate-spin" /> : <Sparkles size={12} />}
+                  Optimize (AI)
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-6 animate-in fade-in slide-in-from-left-4 duration-300">
+              {/* DATA TAB CONTENT */}
+              <div className="p-4 bg-blue-950/10 border border-blue-900/20 rounded-xl space-y-4">
+                 <div className="flex items-center gap-2">
+                   <Database size={16} className="text-blue-400" />
+                   <h3 className="text-xs font-bold uppercase tracking-widest text-slate-200">Database Inspector</h3>
+                 </div>
+                 <p className="text-[10px] text-slate-500 leading-relaxed italic">
+                   Check the data consistency, date ranges, and available fields directly from the cloud.
+                 </p>
+                 <button 
+                   onClick={handleDataCheck}
+                   disabled={checkingDb}
+                   className={cn(
+                     "w-full py-2 bg-blue-600 hover:bg-blue-500 text-white text-[10px] font-bold rounded uppercase tracking-widest transition-all flex items-center justify-center gap-2",
+                     checkingDb && "opacity-50 cursor-not-allowed"
+                   )}
+                 >
+                   {checkingDb ? <div className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <Database size={12} />}
+                   Data Check
+                 </button>
+
+                 <div className="relative">
+                   <input
+                     ref={resetInputRef}
+                     type="file"
+                     className="hidden"
+                     webkitdirectory=""
+                     onChange={handleResetAndUploadFiles}
+                   />
+                   <button 
+                     onClick={handleResetAndUploadTrigger}
+                     disabled={resettingDb || isBacktesting}
+                     className={cn(
+                       "w-full py-2 border border-red-900/50 hover:bg-red-950/20 text-red-400 text-[10px] font-bold rounded uppercase tracking-widest transition-all flex items-center justify-center gap-2",
+                       (resettingDb || isBacktesting) && "opacity-50 cursor-not-allowed"
+                     )}
+                   >
+                     {resettingDb ? <div className="w-3 h-3 border-2 border-red-500/30 border-t-red-500 rounded-full animate-spin" /> : <Trash2 size={12} />}
+                     Reset & Full Import
+                   </button>
+                 </div>
+              </div>
+
+              {dbStats && (
+                <div className="space-y-4 animate-in fade-in zoom-in-95 duration-500">
+                  <div className="space-y-2">
+                    <label className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">Available Range</label>
+                    <div className="bg-slate-900/50 border border-slate-800 rounded-lg p-3 space-y-2">
+                      <div className="flex justify-between items-center text-[10px]">
+                        <span className="text-slate-500 uppercase font-bold">From</span>
+                        <span className="text-slate-200 font-mono text-right">{dbStats.start}</span>
+                      </div>
+                      <div className="flex justify-between items-center text-[10px]">
+                        <span className="text-slate-500 uppercase font-bold">To</span>
+                        <span className="text-slate-200 font-mono text-right">{dbStats.end}</span>
+                      </div>
+                      <div className="pt-2 border-t border-slate-800 flex justify-between items-center text-[10px]">
+                         <span className="text-slate-500 uppercase font-bold">Total Bars</span>
+                         <span className="text-emerald-400 font-mono">{dbStats.totalRecords.toLocaleString()}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">Available Columns</label>
+                    <div className="flex flex-wrap gap-1">
+                      {dbStats.columns.map(c => (
+                        <span key={c} className="text-[9px] px-1.5 py-0.5 bg-slate-800 border border-slate-700 rounded text-blue-400 font-mono uppercase">
+                          {c}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                  
+                  <div className="p-3 bg-amber-950/10 border border-amber-900/20 rounded-lg">
+                    <div className="flex gap-2">
+                      <Info size={12} className="text-amber-500 shrink-0 mt-0.5" />
+                      <p className="text-[9px] text-amber-200/60 leading-normal">
+                        If the dates mismatch your selection, the "Data Check" has refreshed the boundaries to match the latest records.
+                      </p>
+                    </div>
+                  </div>
+                </div>
               )}
-            >
-              {isBacktesting ? <div className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <Play size={12} fill="currentColor" />}
-              Execute Backtest
-            </button>
-            
-            <button 
-              onClick={() => setShowFormulaModal(true)}
-              className="w-full py-2 border border-slate-700 hover:bg-slate-800 text-slate-400 hover:text-blue-400 text-xs font-bold rounded transition-all uppercase tracking-tight flex items-center justify-center gap-2"
-            >
-              <Code2 size={12} />
-              Formula transparency
-            </button>
-            <button 
-              onClick={handleAIOptimize}
-              disabled={!backtestResult || isOptimizing}
-              className="w-full py-2 border border-slate-700 hover:bg-slate-800 text-slate-400 hover:text-emerald-400 text-xs font-bold rounded transition-all uppercase tracking-tight flex items-center justify-center gap-2"
-            >
-              {isOptimizing ? <div className="w-3 h-3 border-2 border-emerald-500/30 border-t-emerald-500 rounded-full animate-spin" /> : <Sparkles size={12} />}
-              Optimize (AI)
-            </button>
-          </div>
+              
+              {!dbStats && !checkingDb && (
+                 <div className="h-40 flex flex-col items-center justify-center opacity-30 text-center px-6">
+                    <div className="w-10 h-10 rounded-full border border-slate-800 flex items-center justify-center mb-3">
+                      <Database size={16} className="text-slate-600" />
+                    </div>
+                    <p className="text-[9px] font-bold uppercase tracking-widest text-slate-500">Click "Data Check" to fetch latest DB summary</p>
+                 </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* AI Lab Snippet */}

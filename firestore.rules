@@ -30,13 +30,14 @@ service cloud.firestore {
     // --- Entity Validations ---
 
     function isValidOHLCBar(data) {
-      return data.keys().hasAll(['time', 'open', 'high', 'low', 'close', 'datasetId'])
+      return data.keys().hasAll(['time', 'open', 'high', 'low', 'close', 'datasetId', 'userId'])
         && data.time is string && data.time.size() <= 64
         && data.open is number && data.open >= 0
         && data.high is number && data.high >= 0
         && data.low is number && data.low >= 0
         && data.close is number && data.close >= 0
         && data.datasetId is string && data.datasetId.size() <= 128
+        && data.userId == request.auth.uid
         && (data.get('volume', 0) is number);
     }
 
@@ -52,7 +53,7 @@ service cloud.firestore {
     // --- Collections ---
 
     match /ohlc_data/{barId} {
-      allow read: if isSignedIn();
+      allow read: if isSignedIn() && (resource == null || resource.data.userId == request.auth.uid);
       allow create: if isSignedIn() && isValidOHLCBar(incoming());
       // Bars are generally immutable in this app
       allow update, delete: if false;

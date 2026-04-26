@@ -13,7 +13,7 @@
         "volume": { "type": "number" },
         "datasetId": { "type": "string" }
       },
-      "required": ["time", "open", "high", "low", "close", "datasetId"]
+      "required": ["time", "open", "high", "low", "close", "datasetId", "userId"]
     },
     "Strategy": {
       "title": "Trading Strategy",
