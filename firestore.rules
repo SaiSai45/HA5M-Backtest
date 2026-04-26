@@ -1,0 +1,70 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // --- Entity Validations ---
+
+    function isValidOHLCBar(data) {
+      return data.keys().hasAll(['time', 'open', 'high', 'low', 'close', 'datasetId'])
+        && data.time is string && data.time.size() <= 64
+        && data.open is number && data.open >= 0
+        && data.high is number && data.high >= 0
+        && data.low is number && data.low >= 0
+        && data.close is number && data.close >= 0
+        && data.datasetId is string && data.datasetId.size() <= 128
+        && (data.get('volume', 0) is number);
+    }
+
+    function isValidStrategy(data) {
+      return data.keys().hasAll(['name', 'candleType', 'userId'])
+        && data.name is string && data.name.size() > 0 && data.name.size() <= 100
+        && data.candleType in ['CANDLE', 'HEIKIN_ASHI', 'RENKO']
+        && isOwner(data.userId)
+        && (data.get('stopLossEnabled', false) is bool)
+        && (data.get('initialCapital', 20000) is number && data.get('initialCapital', 20000) >= 0);
+    }
+
+    // --- Collections ---
+
+    match /ohlc_data/{barId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && isValidOHLCBar(incoming());
+      // Bars are generally immutable in this app
+      allow update, delete: if false;
+    }
+
+    match /strategies/{strategyId} {
+      allow read: if isOwner(resource.data.userId);
+      allow create: if isSignedIn() && isValidStrategy(incoming());
+      allow update: if isOwner(resource.data.userId) 
+                    && isValidStrategy(incoming())
+                    && incoming().userId == existing().userId;
+      allow delete: if isOwner(resource.data.userId);
+    }
+  }
+}

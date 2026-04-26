@@ -11,10 +11,14 @@ export type IndicatorType = 'SMA' | 'EMA' | 'RSI' | 'VWAP';
 
 export type CandleType = 'CANDLE' | 'HEIKIN_ASHI' | 'RENKO';
 
+export type Timeframe = '1m' | '5m' | '15m' | '1h' | '1d';
+
 export interface StrategyRule {
   id: string;
   field: string; // e.g. 'close', 'SMA_20'
   offset: number; // 0 for current, -1 for previous, etc.
+  timeframe: Timeframe;
+  candleType: CandleType;
   operator: '>' | '<' | '>=' | '<=' | 'crosses_above' | 'crosses_below';
   valueType: 'STATIC' | 'FIELD';
   value: number; // used if STATIC
@@ -34,11 +38,12 @@ export interface Strategy {
 // ... (rest remains)
   stopLossPercent: number;
   stopLossPoints: number;
-  stopLossType: 'PERCENT' | 'POINTS';
+  stopLossType: 'PERCENT' | 'POINTS' | 'TOP_MINUS_PTS';
   takeProfitEnabled: boolean;
   takeProfitPercent: number;
   takeProfitPoints: number;
   takeProfitType: 'PERCENT' | 'POINTS';
+  brickSize?: number;
 }
 
 export interface Trade {

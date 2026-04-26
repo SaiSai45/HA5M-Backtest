@@ -8,14 +8,20 @@ import {
 import { 
   BarChart3, Play, Download, Settings, Plus, Sparkles, 
   TrendingUp, TrendingDown, AlertCircle, Trash2, ChevronRight,
-  Upload, FileText, Database, Info, Code2, X
+  Upload, FileText, Database, Info, Code2, X, LogIn, LogOut, User
 } from 'lucide-react';
-import { OHLCData, Strategy, BacktestResult, Trade } from './types';
-import { calculateSMA, calculateRSI, calculateEMA, calculateHeikinAshi } from './lib/indicators';
+import { OHLCData, Strategy, BacktestResult, Trade, Timeframe } from './types';
+import { calculateSMA, calculateRSI, calculateEMA, calculateHeikinAshi, calculateRenko } from './lib/indicators';
 import { runBacktest } from './lib/strategyEngine';
 import { optimizeStrategy } from './services/geminiService';
 import { cn, formatNumber, formatCurrency } from './lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
+import { auth, db, handleFirestoreError, OperationType } from './firebase';
+import { 
+  collection, query, where, orderBy, limit, getDocs, 
+  addDoc, writeBatch, doc, setDoc, onSnapshot 
+} from 'firebase/firestore';
+import { GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged } from 'firebase/auth';
 
 const SAMPLE_STRATEGIES: Strategy[] = [
   {
@@ -26,6 +32,8 @@ const SAMPLE_STRATEGIES: Strategy[] = [
       id: '1', 
       field: 'SMA_20', 
       offset: 0,
+      timeframe: '1m',
+      candleType: 'CANDLE',
       operator: 'crosses_above', 
       valueType: 'FIELD',
       value: 0,
@@ -38,6 +46,8 @@ const SAMPLE_STRATEGIES: Strategy[] = [
       id: '2', 
       field: 'SMA_20', 
       offset: 0,
+      timeframe: '1m',
+      candleType: 'CANDLE',
       operator: 'crosses_below', 
       valueType: 'FIELD',
       value: 0,
@@ -48,45 +58,13 @@ const SAMPLE_STRATEGIES: Strategy[] = [
     }],
     stopLossEnabled: true,
     stopLossPercent: 0.5,
-    stopLossPoints: 10,
-    stopLossType: 'PERCENT',
-    takeProfitEnabled: true,
+    stopLossPoints: 100,
+    stopLossType: 'TOP_MINUS_PTS',
+    takeProfitEnabled: false,
     takeProfitPercent: 1.5,
-    takeProfitPoints: 30,
-    takeProfitType: 'PERCENT'
-  },
-  {
-    id: 'rsi_mean_rev',
-    name: 'RSI Mean Reversion',
-    candleType: 'CANDLE',
-    entryRules: [{ 
-      id: '3', 
-      field: 'RSI_14', 
-      offset: 0,
-      operator: '<', 
-      valueType: 'STATIC',
-      value: 30,
-      buffer: 0,
-      enabled: true 
-    }],
-    exitRules: [{ 
-      id: '4', 
-      field: 'RSI_14', 
-      offset: 0,
-      operator: '>', 
-      valueType: 'STATIC',
-      value: 70,
-      buffer: 0,
-      enabled: true 
-    }],
-    stopLossEnabled: true,
-    stopLossPercent: 1.0,
-    stopLossPoints: 20,
-    stopLossType: 'PERCENT',
-    takeProfitEnabled: true,
-    takeProfitPercent: 2.0,
-    takeProfitPoints: 40,
-    takeProfitType: 'PERCENT'
+    takeProfitPoints: 300,
+    takeProfitType: 'POINTS',
+    brickSize: 10
   }
 ];
 
@@ -111,7 +89,7 @@ function RuleEditor({ rule, idx, onUpdate, onDelete }: any) {
         </button>
       </div>
 
-      <div className="grid grid-cols-2 gap-2">
+      <div className="grid grid-cols-3 gap-2">
         <div className="space-y-1">
           <label className="text-[8px] text-slate-500 uppercase font-bold">Base Field</label>
           <select 
@@ -134,6 +112,28 @@ function RuleEditor({ rule, idx, onUpdate, onDelete }: any) {
             <option value={-2}>-2 (P-Prev)</option>
           </select>
         </div>
+      <div className="grid grid-cols-2 gap-2">
+        <div className="space-y-1">
+          <label className="text-[8px] text-slate-500 uppercase font-bold">Timeframe</label>
+          <select 
+            value={rule.timeframe}
+            onChange={e => onUpdate({...rule, timeframe: e.target.value as Timeframe})}
+            className="w-full bg-slate-800 border border-slate-700 rounded p-1 text-[9px] outline-none"
+          >
+            {['1m', '5m', '15m', '1h', '1d'].map(tf => <option key={tf} value={tf}>{tf}</option>)}
+          </select>
+        </div>
+        <div className="space-y-1">
+          <label className="text-[8px] text-slate-500 uppercase font-bold">Candle Type</label>
+          <select 
+            value={rule.candleType}
+            onChange={e => onUpdate({...rule, candleType: e.target.value as any})}
+            className="w-full bg-slate-800 border border-slate-700 rounded p-1 text-[9px] outline-none"
+          >
+            {['CANDLE', 'HEIKIN_ASHI', 'RENKO'].map(ct => <option key={ct} value={ct}>{ct.replace('_', ' ')}</option>)}
+          </select>
+        </div>
+      </div>
       </div>
 
       <div className="grid grid-cols-3 gap-2">
@@ -208,16 +208,83 @@ function RuleEditor({ rule, idx, onUpdate, onDelete }: any) {
 }
 
 export default function App() {
+  const [user, setUser] = useState<any>(null);
   const [data, setData] = useState<OHLCData[]>([]);
-  const [dataSource, setDataSource] = useState<'SIMULATED' | 'UPLOADED'>('SIMULATED');
+  const [dataSource, setDataSource] = useState<'SIMULATED' | 'FILES' | 'DB'>('SIMULATED');
   const [dateRange, setDateRange] = useState<{ start: string; end: string }>({ start: '', end: '' });
   const [strategy, setStrategy] = useState<Strategy>(SAMPLE_STRATEGIES[0]);
-  const [capital, setCapital] = useState(100000);
+  const [capital, setCapital] = useState(20000);
   const [backtestResult, setBacktestResult] = useState<BacktestResult | null>(null);
   const [isBacktesting, setIsBacktesting] = useState(false);
   const [aiSuggestions, setAiSuggestions] = useState<string | null>(null);
   const [isOptimizing, setIsOptimizing] = useState(false);
   const [showFormulaModal, setShowFormulaModal] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+
+  // Authentication
+  useEffect(() => {
+    return onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      if (u) {
+        loadDataFromFirestore();
+      }
+    });
+  }, []);
+
+  const handleLogin = async () => {
+    const provider = new GoogleAuthProvider();
+    try {
+      await signInWithPopup(auth, provider);
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const handleLogout = async () => {
+    await signOut(auth);
+    setData([]);
+    setDataSource('SIMULATED');
+  };
+
+  const loadDataFromFirestore = async () => {
+    try {
+      const q = query(collection(db, 'ohlc_data'), orderBy('time', 'asc'), limit(2000));
+      const querySnapshot = await getDocs(q);
+      const loadedData: OHLCData[] = [];
+      querySnapshot.forEach((doc) => {
+        loadedData.push(doc.data() as OHLCData);
+      });
+      if (loadedData.length > 0) {
+        setData(loadedData);
+        setDataSource('DB');
+        const start = new Date(loadedData[0].time).toISOString().split('T')[0];
+        const end = new Date(loadedData[loadedData.length - 1].time).toISOString().split('T')[0];
+        setDateRange({ start, end });
+      }
+    } catch (e) {
+      handleFirestoreError(e, OperationType.LIST, 'ohlc_data');
+    }
+  };
+
+  const saveDataToFirestore = async (ohlcData: OHLCData[]) => {
+    if (!user) return;
+    setIsSaving(true);
+    try {
+      const batch = writeBatch(db);
+      // Only save first 500 bars to avoid quota issues for now, or use chunks
+      const limitTo = Math.min(ohlcData.length, 500);
+      for (let i = 0; i < limitTo; i++) {
+        const bar = ohlcData[i];
+        const docRef = doc(collection(db, 'ohlc_data'));
+        batch.set(docRef, { ...bar, datasetId: 'main' });
+      }
+      await batch.commit();
+    } catch (e) {
+      handleFirestoreError(e, OperationType.WRITE, 'ohlc_data');
+    } finally {
+      setIsSaving(false);
+    }
+  };
 
   const formulas = {
     EMA: "EMA = (Close - prevEMA) * [2 / (period + 1)] + prevEMA",
@@ -225,29 +292,45 @@ export default function App() {
     RSI: "RSI = 100 - [100 / (1 + (AvgGain / AvgLoss))]",
     VWAP: "VWAP = Sum(Typical Price * Volume) / Sum(Volume)",
     PNL: "PnL % = ((ExitPrice - EntryPrice) / EntryPrice) * 100 * (Type === 'LONG' ? 1 : -1)",
-    HA: "HA_Close = (O+H+L+C)/4, HA_Open = (prevHA_O + prevHA_C)/2"
+    HA: "HA_Close = (O+H+L+C)/4, HA_Open = (prevHA_O + prevHA_C)/2",
+    Renko: "Renko = Fixed brick size based boxes (Bricks) based on price movement"
   };
 
-  // Generate mock data for initial load
+  // Generate mock data for initial load if no user or no data
   useEffect(() => {
-    const mockData: OHLCData[] = [];
-    let price = 22000;
-    const now = new Date();
-    for (let i = 0; i < 500; i++) {
-      const change = (Math.random() - 0.5) * 10;
-      price += change;
-      mockData.push({
-        time: new Date(now.getTime() - (500 - i) * 60000).toISOString(),
-        open: price - (Math.random() * 2),
-        high: price + (Math.random() * 5),
-        low: price - (Math.random() * 5),
-        close: price,
-        volume: Math.floor(Math.random() * 10000)
-      });
+    if (!user && data.length === 0) {
+      const mockData: OHLCData[] = [];
+      let price = 22000;
+      const now = new Date();
+      for (let i = 0; i < 500; i++) {
+        const change = (Math.random() - 0.5) * 10;
+        price += change;
+        mockData.push({
+          time: new Date(now.getTime() - (500 - i) * 60000).toISOString(),
+          open: price - (Math.random() * 2),
+          high: price + (Math.random() * 5),
+          low: price - (Math.random() * 5),
+          close: price,
+          volume: Math.floor(Math.random() * 10000)
+        });
+      }
+      setData(mockData);
+      setDataSource('SIMULATED');
     }
-    setData(mockData);
-    setDataSource('SIMULATED');
-  }, []);
+  }, [user, data.length]);
+
+  // Sync date range with available data
+  useEffect(() => {
+    if (data.length > 0 && (!dateRange.start || !dateRange.end)) {
+      try {
+        const start = new Date(data[0].time).toISOString().split('T')[0];
+        const end = new Date(data[data.length - 1].time).toISOString().split('T')[0];
+        setDateRange({ start, end });
+      } catch (e) {
+        console.error("Date sync error", e);
+      }
+    }
+  }, [data, dateRange.start, dateRange.end]);
 
   const filteredData = useMemo(() => {
     if (data.length === 0) return [];
@@ -264,10 +347,12 @@ export default function App() {
   const dataWithIndicators = useMemo(() => {
     if (filteredData.length === 0) return [];
     
-    // Apply Heikin Ashi if selected
+    // Apply Heikin Ashi or Renko if selected
     const baseData = strategy.candleType === 'HEIKIN_ASHI' 
       ? calculateHeikinAshi(filteredData) 
-      : filteredData;
+      : strategy.candleType === 'RENKO'
+        ? calculateRenko(filteredData, strategy.brickSize || 10)
+        : filteredData;
 
     const sma20 = calculateSMA(baseData, 20);
     const sma50 = calculateSMA(baseData, 50);
@@ -281,7 +366,7 @@ export default function App() {
       EMA_20: ema20[i],
       RSI_14: rsi14[i]
     }));
-  }, [filteredData, strategy.candleType]);
+  }, [filteredData, strategy.candleType, strategy.brickSize]);
 
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
@@ -302,7 +387,7 @@ export default function App() {
             dynamicTyping: true,
             complete: (results) => {
               const parsed = results.data
-                .filter((d: any) => d.time || d.Date || d.datetime)
+                .filter((d: any) => d && (d.time || d.Date || d.datetime))
                 .map((d: any) => ({
                   time: d.time || d.Date || d.datetime,
                   open: parseFloat(d.open || d.Open),
@@ -310,7 +395,8 @@ export default function App() {
                   low: parseFloat(d.low || d.Low),
                   close: parseFloat(d.close || d.Close),
                   volume: parseFloat(d.volume || d.Volume || 0)
-                }));
+                }))
+                .filter((d: any) => !isNaN(d.open) && !isNaN(d.close));
               allData.push(...parsed);
               resolve();
             }
@@ -328,7 +414,7 @@ export default function App() {
             const jsonData = XLSX.utils.sheet_to_json(worksheet) as any[];
             
             const parsed = jsonData
-              .filter((d: any) => d.time || d.Date || d.datetime)
+              .filter((d: any) => d && (d.time || d.Date || d.datetime))
               .map((d: any) => ({
                 time: d.time || d.Date || d.datetime,
                 open: parseFloat(d.open || d.Open),
@@ -336,7 +422,8 @@ export default function App() {
                 low: parseFloat(d.low || d.Low),
                 close: parseFloat(d.close || d.Close),
                 volume: parseFloat(d.volume || d.Volume || 0)
-              }));
+              }))
+              .filter((d: any) => !isNaN(d.open) && !isNaN(d.close));
             allData.push(...parsed);
             resolve();
           };
@@ -348,19 +435,24 @@ export default function App() {
     // Sort combined data by time
     const sortedData = allData.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
     
-    if (sortedData.length > 0) {
-      setData(sortedData);
-      setDataSource('UPLOADED');
+      if (sortedData.length > 0) {
+        setData(sortedData);
+        setDataSource('FILES');
+        
+        // Auto-populate date range
+        try {
+          const start = new Date(sortedData[0].time).toISOString().split('T')[0];
+          const end = new Date(sortedData[sortedData.length - 1].time).toISOString().split('T')[0];
+          setDateRange({ start, end });
+        } catch (e) {
+          console.error("Could not parse dates for range auto-population", e);
+        }
 
-      // Auto-populate date range based on uploaded data
-      try {
-        const start = new Date(sortedData[0].time).toISOString().split('T')[0];
-        const end = new Date(sortedData[sortedData.length - 1].time).toISOString().split('T')[0];
-        setDateRange({ start, end });
-      } catch (e) {
-        console.error("Could not parse dates for range auto-population", e);
+        // Save to Firestore if user is logged in
+        if (user) {
+          saveDataToFirestore(sortedData);
+        }
       }
-    }
     setIsBacktesting(false);
   };
 
@@ -420,7 +512,7 @@ export default function App() {
             <div>
               <label className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">Candle Type</label>
               <div className="flex bg-slate-900 rounded p-0.5 border border-slate-700 mt-1">
-                {['CANDLE', 'HEIKIN_ASHI'].map(type => (
+                {['CANDLE', 'HEIKIN_ASHI', 'RENKO'].map(type => (
                   <button
                     key={type}
                     onClick={() => setStrategy({...strategy, candleType: type as any})}
@@ -433,6 +525,17 @@ export default function App() {
                   </button>
                 ))}
               </div>
+              {strategy.candleType === 'RENKO' && (
+                <div className="mt-2 flex items-center justify-between gap-2 p-2 bg-slate-800/50 rounded border border-slate-700">
+                  <span className="text-[9px] text-slate-500 font-bold uppercase">Brick Size</span>
+                  <input 
+                    type="number" 
+                    value={strategy.brickSize || 10} 
+                    onChange={e => setStrategy({...strategy, brickSize: parseFloat(e.target.value)})}
+                    className="w-16 bg-slate-900 border border-slate-700 rounded px-1 py-0.5 text-[10px] font-mono outline-none"
+                  />
+                </div>
+              )}
             </div>
 
             <div className="space-y-3">
@@ -445,6 +548,8 @@ export default function App() {
                       id: Math.random().toString(), 
                       field: 'close', 
                       offset: 0, 
+                      timeframe: '1m' as Timeframe,
+                      candleType: 'CANDLE',
                       operator: '>', 
                       valueType: 'STATIC', 
                       value: 0, 
@@ -462,7 +567,7 @@ export default function App() {
                   key={rule.id} 
                   rule={rule} 
                   idx={idx} 
-                  onUpdate={(newRule) => {
+                  onUpdate={(newRule: any) => {
                     const newRules = [...strategy.entryRules];
                     newRules[idx] = newRule;
                     setStrategy({...strategy, entryRules: newRules});
@@ -487,6 +592,8 @@ export default function App() {
                       id: Math.random().toString(), 
                       field: 'close', 
                       offset: 0, 
+                      timeframe: '1m' as Timeframe,
+                      candleType: 'CANDLE',
                       operator: '<', 
                       valueType: 'STATIC', 
                       value: 0, 
@@ -504,7 +611,7 @@ export default function App() {
                   key={rule.id} 
                   rule={rule} 
                   idx={idx} 
-                  onUpdate={(newRule) => {
+                  onUpdate={(newRule: any) => {
                     const newRules = [...strategy.exitRules];
                     newRules[idx] = newRule;
                     setStrategy({...strategy, exitRules: newRules});
@@ -547,16 +654,16 @@ export default function App() {
                   {strategy.stopLossEnabled && (
                     <div className="space-y-2">
                       <div className="flex bg-slate-900 rounded p-0.5 border border-slate-700">
-                        {['PERCENT', 'POINTS'].map(type => (
+                        {['PERCENT', 'POINTS', 'TOP_MINUS_PTS'].map(type => (
                           <button
                             key={type}
                             onClick={() => setStrategy({...strategy, stopLossType: type as any})}
                             className={cn(
-                              "flex-1 py-1 text-[9px] font-bold rounded transition-all",
+                              "flex-1 py-1 text-[8px] font-bold rounded transition-all",
                               strategy.stopLossType === type ? "bg-slate-700 text-slate-100" : "text-slate-500 hover:text-slate-300"
                             )}
                           >
-                            {type}
+                            {type.replace('_', ' ')}
                           </button>
                         ))}
                       </div>
@@ -573,9 +680,6 @@ export default function App() {
                           className="bg-transparent border-none p-0 text-xs font-mono outline-none w-full text-slate-200"
                         />
                         <span className="text-[10px] text-slate-600">{strategy.stopLossType === 'PERCENT' ? '%' : 'pts'}</span>
-                      </div>
-                      <div className="w-full bg-slate-700 h-1 rounded overflow-hidden">
-                        <div className="bg-rose-500 h-full rounded transition-all" style={{ width: `${Math.min(strategy.stopLossType === 'PERCENT' ? strategy.stopLossPercent * 20 : strategy.stopLossPoints / 5, 100)}%` }}></div>
                       </div>
                     </div>
                   )}
@@ -621,9 +725,6 @@ export default function App() {
                           className="bg-transparent border-none p-0 text-xs font-mono outline-none w-full text-slate-200"
                         />
                         <span className="text-[10px] text-slate-600">{strategy.takeProfitType === 'PERCENT' ? '%' : 'pts'}</span>
-                      </div>
-                      <div className="w-full bg-slate-700 h-1 rounded overflow-hidden">
-                        <div className="bg-emerald-500 h-full rounded transition-all" style={{ width: `${Math.min(strategy.takeProfitType === 'PERCENT' ? strategy.takeProfitPercent * 10 : strategy.takeProfitPoints / 10, 100)}%` }}></div>
                       </div>
                     </div>
                   )}
@@ -678,25 +779,55 @@ export default function App() {
       {/* Main Content Area */}
       <main className="flex-1 flex flex-col bg-[#0F1117] min-w-0">
         {/* Top Stats Bar */}
-        <div className="h-16 border-b border-slate-800 flex items-center px-6 gap-10 bg-slate-900/30 shrink-0">
+        <div className="h-16 border-b border-slate-800 flex items-center px-6 gap-8 bg-slate-900/30 shrink-0">
+          <div className="flex items-center gap-4 border-r border-slate-800 pr-8 mr-2">
+            {user ? (
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-full bg-slate-800 flex items-center justify-center overflow-hidden border border-slate-700">
+                  {user.photoURL ? <img src={user.photoURL} alt="Profile" className="w-full h-full object-cover" referrerPolicy="no-referrer" /> : <User size={16} />}
+                </div>
+                <div className="flex flex-col">
+                  <span className="text-[10px] font-bold text-slate-200 leading-none">{user.displayName || 'User'}</span>
+                  <button onClick={handleLogout} className="text-[8px] text-rose-500 hover:text-rose-400 font-bold uppercase mt-1 transition-colors">Sign Out</button>
+                </div>
+              </div>
+            ) : (
+              <button 
+                onClick={handleLogin}
+                className="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded px-3 py-1.5 transition-all"
+              >
+                <LogIn size={14} className="text-emerald-500" />
+                <span className="text-[10px] font-bold uppercase tracking-wider">Sign In</span>
+              </button>
+            )}
+          </div>
+
           {[
-            { label: 'Net Profit', value: backtestResult ? formatCurrency(backtestResult.stats.totalPnl) : '₹0.00', color: 'text-emerald-400' },
+            { 
+              label: 'Net Profit', 
+              value: backtestResult ? formatCurrency(backtestResult.stats.totalPnl) : '₹0.00', 
+              color: backtestResult 
+                ? (backtestResult.stats.totalPnlPercent < 0 
+                    ? 'text-rose-500' 
+                    : (backtestResult.stats.totalPnlPercent <= 50 ? 'text-amber-500' : 'text-emerald-500'))
+                : 'text-slate-500'
+            },
             { label: 'Max Drawdown', value: backtestResult ? `-${formatNumber(backtestResult.stats.maxDrawdown)}%` : '0.00%', color: 'text-rose-400' },
             { label: 'Win Rate', value: backtestResult ? `${formatNumber(backtestResult.stats.winRate)}%` : '0.0% ', color: 'text-slate-300' },
-            { label: 'Sharpe Ratio', value: backtestResult ? '1.42' : '0.00', color: 'text-slate-300' },
+            { label: 'Sharpe', value: backtestResult ? formatNumber(backtestResult.stats.sharpeRatio) : '0.00', color: 'text-blue-400' },
           ].map((stat, i) => (
             <div key={i} className="flex flex-col">
               <span className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">{stat.label}</span>
-              <span className={cn("text-lg font-mono font-bold tracking-tight", stat.color)}>{stat.value}</span>
+              <span className={cn("text-base font-mono font-bold tracking-tight", stat.color)}>{stat.value}</span>
             </div>
           ))}
           
           <div className="ml-auto flex items-center gap-4">
              <label className="flex items-center gap-2 cursor-pointer text-slate-500 hover:text-emerald-500 transition-colors">
               <Upload size={14} />
-              <div className="flex flex-col items-start">
+              <div className="flex flex-col items-start pr-2">
                 <span className="text-[10px] font-bold uppercase tracking-widest leading-none">Import Folder</span>
-                <span className="text-[8px] opacity-60">Collects all CSVs</span>
+                <span className="text-[8px] opacity-60">Collects all CSV/XLS</span>
               </div>
               <input 
                 type="file" 
@@ -730,10 +861,13 @@ export default function App() {
             <div className="text-right">
               <div className="text-[10px] text-slate-500 uppercase font-bold">Data Status</div>
               <div className={cn(
-                "text-[9px] font-mono px-1.5 py-0.5 rounded border",
-                dataSource === 'SIMULATED' ? "text-amber-500 border-amber-500/20 bg-amber-500/5" : "text-emerald-500 border-emerald-500/20 bg-emerald-500/5"
+                "text-[9px] font-mono px-1.5 py-0.5 rounded border flex items-center gap-1.5",
+                dataSource === 'SIMULATED' ? "text-amber-500 border-amber-500/20 bg-amber-500/5" : 
+                dataSource === 'FILES' ? "text-emerald-500 border-emerald-500/20 bg-emerald-500/5" :
+                "text-blue-500 border-blue-500/20 bg-blue-500/5"
               )}>
                 {dataSource}
+                {isSaving && <div className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse" />}
               </div>
             </div>
           </div>

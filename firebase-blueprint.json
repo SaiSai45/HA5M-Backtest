@@ -1,0 +1,45 @@
+{
+  "entities": {
+    "OHLCBar": {
+      "title": "OHLC Bar",
+      "description": "A single candlestick data point",
+      "type": "object",
+      "properties": {
+        "time": { "type": "string", "format": "date-time" },
+        "open": { "type": "number" },
+        "high": { "type": "number" },
+        "low": { "type": "number" },
+        "close": { "type": "number" },
+        "volume": { "type": "number" },
+        "datasetId": { "type": "string" }
+      },
+      "required": ["time", "open", "high", "low", "close", "datasetId"]
+    },
+    "Strategy": {
+      "title": "Trading Strategy",
+      "description": "Definition of a trading strategy with entry/exit rules",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "candleType": { "type": "string", "enum": ["CANDLE", "HEIKIN_ASHI", "RENKO"] },
+        "stopLossEnabled": { "type": "boolean" },
+        "stopLossType": { "type": "string", "enum": ["PERCENT", "POINTS", "TOP_MINUS_PTS"] },
+        "stopLossPercent": { "type": "number" },
+        "stopLossPoints": { "type": "number" },
+        "initialCapital": { "type": "number" },
+        "userId": { "type": "string" }
+      },
+      "required": ["name", "candleType", "userId"]
+    }
+  },
+  "firestore": {
+    "ohlc_data/{barId}": {
+      "schema": "OHLCBar",
+      "description": "Collection of all OHLC bars across all datasets"
+    },
+    "strategies/{strategyId}": {
+      "schema": "Strategy",
+      "description": "User defined trading strategies"
+    }
+  }
+}

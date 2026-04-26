@@ -1,26 +1,103 @@
-import { OHLCData, Strategy, Trade, BacktestResult, StrategyRule } from '../types';
+import { OHLCData, Strategy, Trade, BacktestResult, StrategyRule, Timeframe, CandleType } from '../types';
+import { calculateSMA, calculateRSI, calculateEMA, resampleOHLC, calculateHeikinAshi, calculateRenko } from './indicators';
 
-export function runBacktest(data: OHLCData[], strategy: Strategy, initialCapital = 100000): BacktestResult {
+export function runBacktest(data: OHLCData[], strategy: Strategy, initialCapital = 20000): BacktestResult {
   const trades: Trade[] = [];
-  let currentPosition: { type: 'LONG' | 'SHORT'; entryPrice: number; entryTime: string } | null = null;
+  let currentPosition: { type: 'LONG' | 'SHORT'; entryPrice: number; entryTime: string; maxPrice: number; minPrice: number } | null = null;
   let equity = initialCapital;
   const equityCurve: { time: string; equity: number }[] = [{ time: data[0].time, equity }];
 
-  // Complex rule evaluation
-  const evaluateRule = (rule: StrategyRule, currentIdx: number, dataWithIndicators: any[]): boolean => {
-    // Offset logic (0 for current candle, -1 for previous)
-    const idx = currentIdx + rule.offset;
-    if (idx < 0 || idx >= dataWithIndicators.length) return false;
+  // Pre-calculate data combinations: Timeframe x CandleType
+  const timeframes: Timeframe[] = ['1m', '5m', '15m', '1h', '1d'];
+  const candleTypes: CandleType[] = ['CANDLE', 'HEIKIN_ASHI', 'RENKO'];
+  const resampledData: Record<string, Record<string, any[]>> = {};
 
-    const val = dataWithIndicators[idx][rule.field];
+  const getMultiplier = (tf: Timeframe) => {
+    switch (tf) {
+      case '5m': return 5;
+      case '15m': return 15;
+      case '1h': return 60;
+      case '1d': return 1440;
+      default: return 1;
+    }
+  };
+
+  // We need to resample and add indicators to each combination
+  timeframes.forEach(tf => {
+    resampledData[tf] = {};
+    const baseTfData = tf === '1m' ? data : resampleOHLC(data, getMultiplier(tf));
+
+    candleTypes.forEach(ct => {
+      let ctData: OHLCData[];
+      if (ct === 'HEIKIN_ASHI') {
+        ctData = calculateHeikinAshi(baseTfData);
+      } else if (ct === 'RENKO') {
+        ctData = calculateRenko(baseTfData, strategy.brickSize || 10);
+      } else {
+        ctData = baseTfData;
+      }
+
+      // Add indicators to this combination
+      const sma20 = calculateSMA(ctData, 20);
+      const sma50 = calculateSMA(ctData, 50);
+      const ema20 = calculateEMA(ctData, 20);
+      const rsi14 = calculateRSI(ctData, 14);
+      
+      resampledData[tf][ct] = ctData.map((d, i) => ({
+        ...d,
+        SMA_20: sma20[i],
+        SMA_50: sma50[i],
+        EMA_20: ema20[i],
+        RSI_14: rsi14[i]
+      }));
+    });
+  });
+
+  // Find resampled index for a given timestamp
+  const findResampledIdx = (tf: Timeframe, candleType: CandleType, timestamp: number) => {
+    const list = resampledData[tf]?.[candleType];
+    if (!list || list.length === 0) return -1;
+    
+    // For RENKO, the mapping is harder since time doesn't sync perfectly.
+    // We find the last brick that started before or at this timestamp.
+    let low = 0;
+    let high = list.length - 1;
+    let ans = -1;
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      const midTime = new Date(list[mid].time).getTime();
+      if (midTime <= timestamp) {
+        ans = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    return ans;
+  };
+
+  // Complex rule evaluation
+  const evaluateRule = (rule: StrategyRule, currentTimestamp: number): boolean => {
+    const tf = rule.timeframe || '1m';
+    const ct = rule.candleType || 'CANDLE';
+    const tfData = resampledData[tf]?.[ct];
+    if (!tfData) return false;
+
+    const tfIdx = findResampledIdx(tf, ct, currentTimestamp);
+    
+    // Offset logic (0 for current candle, -1 for previous)
+    const idx = tfIdx + rule.offset;
+    if (idx < 0 || idx >= tfData.length) return false;
+
+    const val = tfData[idx][rule.field];
     
     let target: number;
     if (rule.valueType === 'STATIC') {
       target = rule.value + rule.buffer;
     } else {
-      const tIdx = currentIdx + (rule.valueOffset || 0);
-      if (tIdx < 0 || tIdx >= dataWithIndicators.length) return false;
-      target = (dataWithIndicators[tIdx][rule.valueField || ''] || 0) + rule.buffer;
+      const tIdx = tfIdx + (rule.valueOffset || 0);
+      if (tIdx < 0 || tIdx >= tfData.length) return false;
+      target = (tfData[tIdx][rule.valueField || ''] || 0) + rule.buffer;
     }
 
     if (val === null || target === null || val === undefined || target === undefined) return false;
@@ -33,28 +110,28 @@ export function runBacktest(data: OHLCData[], strategy: Strategy, initialCapital
       case 'crosses_above': {
         const pIdx = idx - 1;
         if (pIdx < 0) return false;
-        const prevVal = dataWithIndicators[pIdx][rule.field];
+        const prevVal = tfData[pIdx][rule.field];
         let prevTarget: number;
         if (rule.valueType === 'STATIC') {
           prevTarget = rule.value + rule.buffer;
         } else {
-          const ptIdx = (currentIdx - 1) + (rule.valueOffset || 0);
+          const ptIdx = (tfIdx - 1) + (rule.valueOffset || 0);
           if (ptIdx < 0) return false;
-          prevTarget = (dataWithIndicators[ptIdx][rule.valueField || ''] || 0) + rule.buffer;
+          prevTarget = (tfData[ptIdx][rule.valueField || ''] || 0) + rule.buffer;
         }
         return prevVal <= prevTarget && val > target;
       }
       case 'crosses_below': {
         const pIdx = idx - 1;
         if (pIdx < 0) return false;
-        const prevVal = dataWithIndicators[pIdx][rule.field];
+        const prevVal = tfData[pIdx][rule.field];
         let prevTarget: number;
         if (rule.valueType === 'STATIC') {
           prevTarget = rule.value + rule.buffer;
         } else {
-          const ptIdx = (currentIdx - 1) + (rule.valueOffset || 0);
+          const ptIdx = (tfIdx - 1) + (rule.valueOffset || 0);
           if (ptIdx < 0) return false;
-          prevTarget = (dataWithIndicators[ptIdx][rule.valueField || ''] || 0) + rule.buffer;
+          prevTarget = (tfData[ptIdx][rule.valueField || ''] || 0) + rule.buffer;
         }
         return prevVal >= prevTarget && val < target;
       }
@@ -65,8 +142,12 @@ export function runBacktest(data: OHLCData[], strategy: Strategy, initialCapital
   // Main loop
   for (let i = 1; i < data.length; i++) {
     const bar = data[i];
+    const timestamp = new Date(bar.time).getTime();
 
     if (currentPosition) {
+      currentPosition.maxPrice = Math.max(currentPosition.maxPrice, bar.high);
+      currentPosition.minPrice = Math.min(currentPosition.minPrice, bar.low);
+
       // Calculate profit/loss
       const priceDiff = bar.close - currentPosition.entryPrice;
       const profitPoints = currentPosition.type === 'LONG' ? priceDiff : -priceDiff;
@@ -78,8 +159,14 @@ export function runBacktest(data: OHLCData[], strategy: Strategy, initialCapital
       if (strategy.stopLossEnabled) {
         if (strategy.stopLossType === 'PERCENT') {
           if (profitPct <= -strategy.stopLossPercent) exitReason = 'STOP_LOSS';
-        } else {
+        } else if (strategy.stopLossType === 'POINTS') {
           if (profitPoints <= -strategy.stopLossPoints) exitReason = 'STOP_LOSS';
+        } else if (strategy.stopLossType === 'TOP_MINUS_PTS') {
+          if (currentPosition.type === 'LONG') {
+            if (bar.low <= currentPosition.maxPrice - strategy.stopLossPoints) exitReason = 'STOP_LOSS';
+          } else {
+            if (bar.high >= currentPosition.minPrice + strategy.stopLossPoints) exitReason = 'STOP_LOSS';
+          }
         }
       }
 
@@ -92,10 +179,10 @@ export function runBacktest(data: OHLCData[], strategy: Strategy, initialCapital
         }
       }
 
-      // Check exit rules if no SL/TP triggered
+      // Check exit rules
       if (!exitReason) {
         const enabledExitRules = strategy.exitRules.filter(r => r.enabled);
-        const shouldExit = enabledExitRules.length > 0 && enabledExitRules.every(rule => evaluateRule(rule, i, data));
+        const shouldExit = enabledExitRules.length > 0 && enabledExitRules.every(rule => evaluateRule(rule, timestamp));
         if (shouldExit) exitReason = 'EXIT_RULE';
       }
 
@@ -118,12 +205,14 @@ export function runBacktest(data: OHLCData[], strategy: Strategy, initialCapital
     } else {
       // Check entry rules
       const enabledEntryRules = strategy.entryRules.filter(r => r.enabled);
-      const shouldEnter = enabledEntryRules.length > 0 && enabledEntryRules.every(rule => evaluateRule(rule, i, data));
+      const shouldEnter = enabledEntryRules.length > 0 && enabledEntryRules.every(rule => evaluateRule(rule, timestamp));
       if (shouldEnter) {
         currentPosition = {
-          type: 'LONG', // Simple long-only for now
+          type: 'LONG',
           entryPrice: bar.close,
-          entryTime: bar.time
+          entryTime: bar.time,
+          maxPrice: bar.high,
+          minPrice: bar.low
         };
       }
     }
@@ -134,6 +223,15 @@ export function runBacktest(data: OHLCData[], strategy: Strategy, initialCapital
   const winTrades = trades.filter(t => t.pnl > 0);
   const winRate = trades.length > 0 ? (winTrades.length / trades.length) * 100 : 0;
   const totalPnl = trades.reduce((acc, t) => acc + t.pnl, 0);
+
+  // Sharpe Ratio calculation
+  const returns = trades.map(t => t.pnlPercent);
+  let sharpeRatio = 0;
+  if (returns.length > 1) {
+    const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
+    const stdDev = Math.sqrt(returns.map(x => Math.pow(x - mean, 2)).reduce((a, b) => a + b, 0) / (returns.length - 1));
+    sharpeRatio = stdDev !== 0 ? (mean / stdDev) * Math.sqrt(252) : 0; // Annualized (sqrt 252 for daily, but here we use per-trade returns as proxy)
+  }
 
   // Simple drawdown calculation
   let maxEquity = initialCapital;
@@ -152,7 +250,7 @@ export function runBacktest(data: OHLCData[], strategy: Strategy, initialCapital
       winRate,
       totalTrades: trades.length,
       maxDrawdown: maxDd,
-      sharpeRatio: 0 // Skeleton
+      sharpeRatio: sharpeRatio
     },
     equityCurve
   };

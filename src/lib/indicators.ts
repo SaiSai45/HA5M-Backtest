@@ -113,3 +113,63 @@ export function calculateHeikinAshi(data: OHLCData[]): OHLCData[] {
   }
   return haData;
 }
+
+export function calculateRenko(data: OHLCData[], brickSize: number): OHLCData[] {
+  if (data.length === 0) return [];
+  const renko: OHLCData[] = [];
+  let prevBrickClose = Math.round(data[0].close / brickSize) * brickSize;
+  
+  for (let i = 0; i < data.length; i++) {
+    const price = data[i].close;
+    const diff = price - prevBrickClose;
+    const numBricks = Math.floor(Math.abs(diff) / brickSize);
+    
+    for (let j = 0; j < numBricks; j++) {
+      const direction = diff > 0 ? 1 : -1;
+      const open = prevBrickClose;
+      const close = prevBrickClose + (direction * brickSize);
+      renko.push({
+        time: data[i].time,
+        open,
+        high: Math.max(open, close),
+        low: Math.min(open, close),
+        close,
+        volume: data[i].volume
+      });
+      prevBrickClose = close;
+    }
+  }
+  return renko;
+}
+
+export function resampleOHLC(data: OHLCData[], timeframeMinutes: number): OHLCData[] {
+  if (data.length === 0) return [];
+  const resampled: OHLCData[] = [];
+  let currentBin: OHLCData | null = null;
+  
+  for (const bar of data) {
+    const time = new Date(bar.time);
+    const timestamp = time.getTime();
+    const intervalMs = timeframeMinutes * 60000;
+    const binStartTime = Math.floor(timestamp / intervalMs) * intervalMs;
+    
+    if (!currentBin || new Date(currentBin.time).getTime() !== binStartTime) {
+      if (currentBin) resampled.push(currentBin);
+      currentBin = {
+        time: new Date(binStartTime).toISOString(),
+        open: bar.open,
+        high: bar.high,
+        low: bar.low,
+        close: bar.close,
+        volume: bar.volume || 0
+      };
+    } else {
+      currentBin.high = Math.max(currentBin.high, bar.high);
+      currentBin.low = Math.min(currentBin.low, bar.low);
+      currentBin.close = bar.close;
+      currentBin.volume = (currentBin.volume || 0) + (bar.volume || 0);
+    }
+  }
+  if (currentBin) resampled.push(currentBin);
+  return resampled;
+}
