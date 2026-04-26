@@ -19,7 +19,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { auth, db, handleFirestoreError, OperationType } from './firebase';
 import { 
   collection, query, where, orderBy, limit, getDocs, 
-  addDoc, writeBatch, doc, setDoc, onSnapshot 
+  addDoc, writeBatch, doc, setDoc, onSnapshot, getDocFromServer
 } from 'firebase/firestore';
 import { GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged } from 'firebase/auth';
 
@@ -221,9 +221,82 @@ interface UploadStatus {
 export default function App() {
   const [user, setUser] = useState<any>(null);
   const [data, setData] = useState<OHLCData[]>([]);
-  const [dataSource, setDataSource] = useState<'SIMULATED' | 'FILES' | 'DB'>('DB');
+  const [dataSource, setDataSource] = useState<'SIMULATED' | 'FILES' | 'DB'>(() => {
+    const saved = localStorage.getItem('bt_data_source');
+    return (saved as any) || 'DB';
+  });
   const [dbError, setDbError] = useState<string | null>(null);
-  const [dateRange, setDateRange] = useState<{ start: string; end: string }>({ start: '', end: '' });
+  const [notification, setNotification] = useState<{message: string, type: 'info' | 'error'} | null>(null);
+  const [dataBounds, setDataBounds] = useState<{ start: string; end: string }>({ start: '', end: '' });
+  const [dateRange, setDateRange] = useState<{ start: string; end: string }>(() => {
+    const saved = localStorage.getItem('bt_date_range');
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (parsed.start && parsed.end) return parsed;
+      } catch (e) {}
+    }
+    return { start: '', end: '' };
+  });
+
+  const handleDateChange = (type: 'start' | 'end', value: string) => {
+    if (!value) return;
+    
+    let newStart = type === 'start' ? value : dateRange.start;
+    let newEnd = type === 'end' ? value : dateRange.end;
+
+    // Enforce Bounds
+    if (dataBounds.start && newStart < dataBounds.start) {
+      newStart = dataBounds.start;
+      setNotification({ message: `Least date available is ${new Date(dataBounds.start).toLocaleDateString()}`, type: 'info' });
+      setTimeout(() => setNotification(null), 4000);
+    }
+    
+    if (dataBounds.end && newEnd > dataBounds.end) {
+      newEnd = dataBounds.end;
+      setNotification({ message: `Latest date available is ${new Date(dataBounds.end).toLocaleDateString()}`, type: 'info' });
+      setTimeout(() => setNotification(null), 4000);
+    }
+
+    // Ensure logical order
+    if (newStart > newEnd) {
+      if (type === 'start') newEnd = newStart;
+      else newStart = newEnd;
+    }
+
+    setDateRange({ start: newStart, end: newEnd });
+  };
+
+  // Sync date range with available data bounds
+  useEffect(() => {
+    if (dataBounds.start && dataBounds.end) {
+      let newStart = dateRange.start;
+      let newEnd = dateRange.end;
+      let changed = false;
+
+      if (!newStart || newStart < dataBounds.start) {
+        newStart = dataBounds.start;
+        changed = true;
+      }
+      if (!newEnd || newEnd > dataBounds.end) {
+        newEnd = dataBounds.end;
+        changed = true;
+      }
+
+      if (changed) {
+        console.log("Enforcing data bounds:", { start: newStart, end: newEnd });
+        setDateRange({ start: newStart, end: newEnd });
+        
+        // Show notification ONLY if it wasn't a "fresh" load (i.e. if user had something else in mind)
+        const saved = localStorage.getItem('bt_date_range');
+        if (saved) {
+           setNotification({ message: `Range adjusted to available data: ${new Date(dataBounds.start).toLocaleDateString()} to ${new Date(dataBounds.end).toLocaleDateString()}`, type: 'info' });
+           setTimeout(() => setNotification(null), 5000);
+        }
+      }
+    }
+  }, [dataBounds]);
+
   const [strategy, setStrategy] = useState<Strategy>(() => {
     const saved = localStorage.getItem('bt_strategy');
     return saved ? JSON.parse(saved) : SAMPLE_STRATEGIES[0];
@@ -242,14 +315,18 @@ export default function App() {
   const [pendingImportData, setPendingImportData] = useState<{data: OHLCData[], fileName: string} | null>(null);
   const [uploadStatus, setUploadStatus] = useState<UploadStatus>({
     isUploading: false,
-    currentFile: '',
     processedFiles: 0,
     totalFiles: 0,
+    currentFile: '',
     currentDateRange: '',
     progress: 0
   });
 
   // Persistence
+  useEffect(() => {
+    if (dataSource) localStorage.setItem('bt_data_source', dataSource);
+  }, [dataSource]);
+
   useEffect(() => {
     localStorage.setItem('bt_strategy', JSON.stringify(strategy));
   }, [strategy]);
@@ -268,11 +345,11 @@ export default function App() {
   useEffect(() => {
     return onAuthStateChanged(auth, (u) => {
       setUser(u);
-      if (u) {
+      if (u && dataSource === 'DB') {
         loadDataFromFirestore();
       }
     });
-  }, []);
+  }, [dataSource]);
 
   const handleLogin = async () => {
     const provider = new GoogleAuthProvider();
@@ -287,12 +364,24 @@ export default function App() {
     await signOut(auth);
     setData([]);
     setDataSource('SIMULATED');
+    localStorage.removeItem('bt_date_range');
   };
 
   const loadDataFromFirestore = async () => {
     if (!user) return;
     setDbError(null);
     try {
+      console.log("Connecting to Database...");
+      // Test connection with getDocFromServer as per best practices
+      const testDocRef = doc(db, 'ohlc_data', 'ping'); // dummy doc
+      try {
+        await getDocFromServer(testDocRef);
+      } catch (e: any) {
+        // Even if doc doesn't exist, if it returns, it connected. 
+        // If it throws "offline", it failed.
+        if (e.message?.includes('offline')) throw e;
+      }
+
       // 1. First find the absolute bounds for this user
       const qMin = query(collection(db, 'ohlc_data'), where('userId', '==', user.uid), orderBy('time', 'asc'), limit(1));
       const qMax = query(collection(db, 'ohlc_data'), where('userId', '==', user.uid), orderBy('time', 'desc'), limit(1));
@@ -302,10 +391,26 @@ export default function App() {
       let dbStart = '';
       let dbEnd = '';
       
-      if (!snapMin.empty) dbStart = snapMin.docs[0].data().time;
-      if (!snapMax.empty) dbEnd = snapMax.docs[0].data().time;
+      if (!snapMin.empty) {
+        dbStart = snapMin.docs[0].data().time;
+      }
+      if (!snapMax.empty) {
+        dbEnd = snapMax.docs[0].data().time;
+      }
 
-      // 2. Load a reasonable chunk of data (last 2000 bars by default if not specified)
+      const startDate = (dbStart || '').split('T')[0];
+      const endDate = (dbEnd || '').split('T')[0];
+      
+      if (startDate && endDate) {
+        setDataBounds({ start: startDate, end: endDate });
+        setDataSource('DB');
+      } else {
+        console.log("Database connected but empty. Defaulting to Simulated.");
+        setDataSource('SIMULATED');
+        return;
+      }
+
+      // 2. Load the most recent chunk of data
       const q = query(collection(db, 'ohlc_data'), where('userId', '==', user.uid), orderBy('time', 'desc'), limit(2000));
       const querySnapshot = await getDocs(q);
       const loadedData: OHLCData[] = [];
@@ -314,20 +419,16 @@ export default function App() {
       });
       
       if (loadedData.length > 0) {
-        // Sort back to ascending for internal logic
         const sortedLoaded = loadedData.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
         setData(sortedLoaded);
-        setDataSource('DB');
-        
-        // Use the absolute bounds from the DB for the date range picker
-        const start = new Date(dbStart || sortedLoaded[0].time).toISOString().split('T')[0];
-        const end = new Date(dbEnd || sortedLoaded[sortedLoaded.length - 1].time).toISOString().split('T')[0];
-        setDateRange({ start, end });
-        console.log(`Loaded ${sortedLoaded.length} bars from DB. Bounds: ${start} to ${end}`);
+        console.log(`DB Sync Complete. Bounds: ${startDate} to ${endDate}`);
       }
     } catch (e: any) {
-      console.error("DB Load error:", e);
-      setDbError(e.message || "Failed to reach database. Check permissions or network.");
+      console.error("Database Connection Failed:", e);
+      setDbError("Database unreachable. Switched to Simulated mode.");
+      setDataSource('SIMULATED');
+      setNotification({ message: "DB Connection Failed - Using Simulated Data", type: 'error' });
+      setTimeout(() => setNotification(null), 6000);
     }
   };
 
@@ -502,22 +603,11 @@ export default function App() {
         });
       }
       setData(mockData);
+      const start = mockData[0].time.split('T')[0];
+      const end = mockData[mockData.length - 1].time.split('T')[0];
+      setDataBounds({ start, end });
     }
   }, [dataSource, data.length]);
-
-  // Sync date range with available data
-  useEffect(() => {
-    // If no range is set, or we're in SIMULATED/FILES mode, sync with data bounds
-    if (data.length > 0) {
-      const actualStart = data[0].time.split('T')[0];
-      const actualEnd = data[data.length - 1].time.split('T')[0];
-      
-      // If no range exists or it's currently invalid for the dataset, reset to full bounds
-      if (!dateRange.start || !dateRange.end || dateRange.end < actualStart || dateRange.start > actualEnd) {
-        setDateRange({ start: actualStart, end: actualEnd });
-      }
-    }
-  }, [data, dataSource]);
 
   const filteredData = useMemo(() => {
     if (data.length === 0) return [];
@@ -700,10 +790,12 @@ export default function App() {
       setData(uniqueData);
       setDataSource('FILES');
       
+      const start = uniqueData[0].time.split('T')[0];
+      const end = uniqueData[uniqueData.length - 1].time.split('T')[0];
+      setDataBounds({ start, end });
+      
       // Auto-populate date range
       try {
-        const start = uniqueData[0].time.split('T')[0];
-        const end = uniqueData[uniqueData.length - 1].time.split('T')[0];
         setDateRange({ start, end });
         console.log(`Successfully merged ${uniqueData.length} bars. Full Range: ${start} to ${end}`);
       } catch (e) {
@@ -1101,7 +1193,9 @@ export default function App() {
                 <input 
                   type="date" 
                   value={dateRange.start}
-                  onChange={e => setDateRange(prev => ({ ...prev, start: e.target.value }))}
+                  min={dataBounds.start}
+                  max={dateRange.end}
+                  onChange={e => handleDateChange('start', e.target.value)}
                   className="bg-slate-800 border border-slate-700 rounded px-1.5 py-0.5 text-[10px] font-mono outline-none focus:border-emerald-500 transition-colors text-slate-300"
                 />
               </div>
@@ -1110,7 +1204,9 @@ export default function App() {
                 <input 
                   type="date" 
                   value={dateRange.end}
-                  onChange={e => setDateRange(prev => ({ ...prev, end: e.target.value }))}
+                  min={dateRange.start}
+                  max={dataBounds.end}
+                  onChange={e => handleDateChange('end', e.target.value)}
                   className="bg-slate-800 border border-slate-700 rounded px-1.5 py-0.5 text-[10px] font-mono outline-none focus:border-emerald-500 transition-colors text-slate-300"
                 />
               </div>
@@ -1149,6 +1245,26 @@ export default function App() {
             </div>
           </div>
         </div>
+
+        {/* Notifications */}
+        <AnimatePresence>
+          {notification && (
+            <motion.div 
+              initial={{ y: -50, opacity: 0 }}
+              animate={{ y: 0, opacity: 1 }}
+              exit={{ y: -50, opacity: 0 }}
+              className="fixed top-20 left-1/2 -translate-x-1/2 z-[200]"
+            >
+              <div className={cn(
+                "px-4 py-2 rounded-full shadow-2xl border backdrop-blur-md flex items-center gap-2",
+                notification.type === 'error' ? "bg-rose-500/20 border-rose-500/30 text-rose-400" : "bg-blue-500/20 border-blue-500/30 text-blue-400"
+              )}>
+                <Info size={14} />
+                <span className="text-xs font-bold uppercase tracking-tight">{notification.message}</span>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         {/* DB Error Alert */}
         <AnimatePresence>
