@@ -115,7 +115,7 @@ export function calculateHeikinAshi(data: OHLCData[]): OHLCData[] {
 }
 
 export function calculateRenko(data: OHLCData[], brickSize: number): OHLCData[] {
-  if (data.length === 0) return [];
+  if (data.length === 0 || !brickSize || brickSize <= 0) return [];
   const renko: OHLCData[] = [];
   let prevBrickClose = Math.round(data[0].close / brickSize) * brickSize;
   
@@ -125,6 +125,7 @@ export function calculateRenko(data: OHLCData[], brickSize: number): OHLCData[] 
     const numBricks = Math.floor(Math.abs(diff) / brickSize);
     
     for (let j = 0; j < numBricks; j++) {
+      if (renko.length > 5000) return renko; // Performance and recursion safety
       const direction = diff > 0 ? 1 : -1;
       const open = prevBrickClose;
       const close = prevBrickClose + (direction * brickSize);

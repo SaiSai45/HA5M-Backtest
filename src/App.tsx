@@ -112,6 +112,8 @@ function RuleEditor({ rule, idx, onUpdate, onDelete }: any) {
             <option value={-2}>-2 (P-Prev)</option>
           </select>
         </div>
+      </div>
+
       <div className="grid grid-cols-2 gap-2">
         <div className="space-y-1">
           <label className="text-[8px] text-slate-500 uppercase font-bold">Timeframe</label>
@@ -133,7 +135,6 @@ function RuleEditor({ rule, idx, onUpdate, onDelete }: any) {
             {['CANDLE', 'HEIKIN_ASHI', 'RENKO'].map(ct => <option key={ct} value={ct}>{ct.replace('_', ' ')}</option>)}
           </select>
         </div>
-      </div>
       </div>
 
       <div className="grid grid-cols-3 gap-2">
@@ -207,19 +208,61 @@ function RuleEditor({ rule, idx, onUpdate, onDelete }: any) {
   );
 }
 
+interface UploadStatus {
+  isUploading: boolean;
+  currentFile: string;
+  processedFiles: number;
+  totalFiles: number;
+  currentDateRange: string;
+  progress: number;
+  error?: string;
+}
+
 export default function App() {
   const [user, setUser] = useState<any>(null);
   const [data, setData] = useState<OHLCData[]>([]);
-  const [dataSource, setDataSource] = useState<'SIMULATED' | 'FILES' | 'DB'>('SIMULATED');
+  const [dataSource, setDataSource] = useState<'SIMULATED' | 'FILES' | 'DB'>('DB');
+  const [dbError, setDbError] = useState<string | null>(null);
   const [dateRange, setDateRange] = useState<{ start: string; end: string }>({ start: '', end: '' });
-  const [strategy, setStrategy] = useState<Strategy>(SAMPLE_STRATEGIES[0]);
-  const [capital, setCapital] = useState(20000);
+  const [strategy, setStrategy] = useState<Strategy>(() => {
+    const saved = localStorage.getItem('bt_strategy');
+    return saved ? JSON.parse(saved) : SAMPLE_STRATEGIES[0];
+  });
+  const [capital, setCapital] = useState(() => {
+    const saved = localStorage.getItem('bt_capital');
+    return saved ? parseFloat(saved) : 20000;
+  });
   const [backtestResult, setBacktestResult] = useState<BacktestResult | null>(null);
   const [isBacktesting, setIsBacktesting] = useState(false);
   const [aiSuggestions, setAiSuggestions] = useState<string | null>(null);
   const [isOptimizing, setIsOptimizing] = useState(false);
   const [showFormulaModal, setShowFormulaModal] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [showOverwriteModal, setShowOverwriteModal] = useState(false);
+  const [pendingImportData, setPendingImportData] = useState<{data: OHLCData[], fileName: string} | null>(null);
+  const [uploadStatus, setUploadStatus] = useState<UploadStatus>({
+    isUploading: false,
+    currentFile: '',
+    processedFiles: 0,
+    totalFiles: 0,
+    currentDateRange: '',
+    progress: 0
+  });
+
+  // Persistence
+  useEffect(() => {
+    localStorage.setItem('bt_strategy', JSON.stringify(strategy));
+  }, [strategy]);
+
+  useEffect(() => {
+    localStorage.setItem('bt_capital', capital.toString());
+  }, [capital]);
+
+  useEffect(() => {
+    if (dateRange.start && dateRange.end) {
+      localStorage.setItem('bt_date_range', JSON.stringify(dateRange));
+    }
+  }, [dateRange]);
 
   // Authentication
   useEffect(() => {
@@ -247,43 +290,187 @@ export default function App() {
   };
 
   const loadDataFromFirestore = async () => {
+    if (!user) return;
+    setDbError(null);
     try {
-      const q = query(collection(db, 'ohlc_data'), orderBy('time', 'asc'), limit(2000));
+      // 1. First find the absolute bounds for this user
+      const qMin = query(collection(db, 'ohlc_data'), where('userId', '==', user.uid), orderBy('time', 'asc'), limit(1));
+      const qMax = query(collection(db, 'ohlc_data'), where('userId', '==', user.uid), orderBy('time', 'desc'), limit(1));
+      
+      const [snapMin, snapMax] = await Promise.all([getDocs(qMin), getDocs(qMax)]);
+      
+      let dbStart = '';
+      let dbEnd = '';
+      
+      if (!snapMin.empty) dbStart = snapMin.docs[0].data().time;
+      if (!snapMax.empty) dbEnd = snapMax.docs[0].data().time;
+
+      // 2. Load a reasonable chunk of data (last 2000 bars by default if not specified)
+      const q = query(collection(db, 'ohlc_data'), where('userId', '==', user.uid), orderBy('time', 'desc'), limit(2000));
       const querySnapshot = await getDocs(q);
       const loadedData: OHLCData[] = [];
       querySnapshot.forEach((doc) => {
         loadedData.push(doc.data() as OHLCData);
       });
+      
       if (loadedData.length > 0) {
-        setData(loadedData);
+        // Sort back to ascending for internal logic
+        const sortedLoaded = loadedData.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+        setData(sortedLoaded);
         setDataSource('DB');
-        const start = new Date(loadedData[0].time).toISOString().split('T')[0];
-        const end = new Date(loadedData[loadedData.length - 1].time).toISOString().split('T')[0];
+        
+        // Use the absolute bounds from the DB for the date range picker
+        const start = new Date(dbStart || sortedLoaded[0].time).toISOString().split('T')[0];
+        const end = new Date(dbEnd || sortedLoaded[sortedLoaded.length - 1].time).toISOString().split('T')[0];
         setDateRange({ start, end });
+        console.log(`Loaded ${sortedLoaded.length} bars from DB. Bounds: ${start} to ${end}`);
       }
-    } catch (e) {
-      handleFirestoreError(e, OperationType.LIST, 'ohlc_data');
+    } catch (e: any) {
+      console.error("DB Load error:", e);
+      setDbError(e.message || "Failed to reach database. Check permissions or network.");
     }
   };
 
-  const saveDataToFirestore = async (ohlcData: OHLCData[]) => {
+  const saveDataToFirestore = async (ohlcData: OHLCData[], fileName: string = 'Imported Data') => {
     if (!user) return;
     setIsSaving(true);
+    
+    // Identify date range for this chunk/file
+    let dateRangeStr = 'Unknown';
+    if (ohlcData.length > 0) {
+      const start = new Date(ohlcData[0].time).toLocaleDateString();
+      const end = new Date(ohlcData[ohlcData.length - 1].time).toLocaleDateString();
+      dateRangeStr = `${start} - ${end}`;
+    }
+
+    setUploadStatus(prev => ({
+      ...prev,
+      isUploading: true,
+      currentFile: fileName,
+      currentDateRange: dateRangeStr
+    }));
+
     try {
-      const batch = writeBatch(db);
-      // Only save first 500 bars to avoid quota issues for now, or use chunks
-      const limitTo = Math.min(ohlcData.length, 500);
-      for (let i = 0; i < limitTo; i++) {
-        const bar = ohlcData[i];
-        const docRef = doc(collection(db, 'ohlc_data'));
-        batch.set(docRef, { ...bar, datasetId: 'main' });
+      // Chunk size for Firestore batches (limit is 500)
+      const CHUNK_SIZE = 400;
+      const totalSteps = Math.ceil(ohlcData.length / CHUNK_SIZE);
+      
+      if (totalSteps > 1 && ohlcData.length > 1000) {
+        setUploadStatus(prev => ({ ...prev, progress: 0 }));
       }
-      await batch.commit();
-    } catch (e) {
-      handleFirestoreError(e, OperationType.WRITE, 'ohlc_data');
+
+      for (let i = 0; i < ohlcData.length; i += CHUNK_SIZE) {
+        const batch = writeBatch(db);
+        const chunk = ohlcData.slice(i, i + CHUNK_SIZE);
+        
+        chunk.forEach(bar => {
+          const docRef = doc(collection(db, 'ohlc_data'));
+          batch.set(docRef, { ...bar, datasetId: 'main', userId: user.uid });
+        });
+
+        try {
+          await batch.commit();
+        } catch (e: any) {
+          if (e.code === 'resource-exhausted' || e.message?.includes('Quota')) {
+             setUploadStatus(prev => ({ 
+               ...prev, 
+               isUploading: false, 
+               error: "Daily Storage Quota Exceeded. Data saved locally only." 
+             }));
+             return; // Stop further cloud writes
+          }
+          throw e;
+        }
+        
+        const step = Math.floor(i / CHUNK_SIZE) + 1;
+        setUploadStatus(prev => ({
+          ...prev,
+          progress: Math.floor((step / totalSteps) * 100)
+        }));
+      }
+    } catch (e: any) {
+      if (e.code !== 'resource-exhausted') {
+        handleFirestoreError(e, OperationType.WRITE, 'ohlc_data');
+      }
     } finally {
       setIsSaving(false);
     }
+  };
+
+  const checkDuplicatesAndSave = async (ohlcData: OHLCData[], fileName: string) => {
+    if (!user || ohlcData.length === 0) return;
+    
+    setIsSaving(true);
+    setUploadStatus(prev => ({ ...prev, isUploading: true, currentFile: fileName, progress: 0 }));
+    
+    try {
+      const startTime = new Date(ohlcData[0].time).toISOString();
+      const endTime = new Date(ohlcData[ohlcData.length - 1].time).toISOString();
+      
+      // Check if any data exists in this range
+      const q = query(
+        collection(db, 'ohlc_data'), 
+        where('userId', '==', user.uid),
+        where('time', '>=', startTime),
+        where('time', '<=', endTime),
+        limit(1)
+      );
+      
+      const snapshot = await getDocs(q);
+      
+      if (!snapshot.empty) {
+        setPendingImportData({ data: ohlcData, fileName });
+        setShowOverwriteModal(true);
+        setIsSaving(false);
+      } else {
+        await saveDataToFirestore(ohlcData, fileName);
+      }
+    } catch (e) {
+      console.error("Duplicate check failed", e);
+      // Fallback to normal save if check fails
+      await saveDataToFirestore(ohlcData, fileName);
+    }
+  };
+
+  const handleOverwriteDecision = async (decision: 'OVERWRITE' | 'MERGE' | 'CANCEL') => {
+    if (!pendingImportData) return;
+    
+    const { data: ohlcData, fileName } = pendingImportData;
+    setShowOverwriteModal(false);
+    setPendingImportData(null);
+
+    if (decision === 'CANCEL') return;
+
+    setIsSaving(true);
+    setUploadStatus(prev => ({ ...prev, isUploading: true, currentFile: fileName, progress: 0 }));
+
+    if (decision === 'OVERWRITE') {
+      try {
+        const startTime = new Date(ohlcData[0].time).toISOString();
+        const endTime = new Date(ohlcData[ohlcData.length - 1].time).toISOString();
+        
+        // Find existing docs to delete
+        const q = query(
+          collection(db, 'ohlc_data'), 
+          where('userId', '==', user.uid),
+          where('time', '>=', startTime),
+          where('time', '<=', endTime)
+        );
+        
+        const snapshot = await getDocs(q);
+        const batch = writeBatch(db);
+        snapshot.forEach(doc => batch.delete(doc.ref));
+        await batch.commit();
+      } catch (e) {
+        console.error("Overwrite deletion failed", e);
+      }
+    } else if (decision === 'MERGE') {
+      // In merge mode, we only want to keep data that doesn't already exist.
+      // For simplicity, we filter out points that are in the exact same timestamps 
+      // if we already queried them, but a better way is to rely on setDoc with specific IDs if we had them.
+    }
+
+    await saveDataToFirestore(ohlcData, fileName);
   };
 
   const formulas = {
@@ -296,9 +483,9 @@ export default function App() {
     Renko: "Renko = Fixed brick size based boxes (Bricks) based on price movement"
   };
 
-  // Generate mock data for initial load if no user or no data
+  // Generate mock data for initial load or when SIMULATED is selected
   useEffect(() => {
-    if (!user && data.length === 0) {
+    if (dataSource === 'SIMULATED' && data.length === 0) {
       const mockData: OHLCData[] = [];
       let price = 22000;
       const now = new Date();
@@ -315,22 +502,22 @@ export default function App() {
         });
       }
       setData(mockData);
-      setDataSource('SIMULATED');
     }
-  }, [user, data.length]);
+  }, [dataSource, data.length]);
 
   // Sync date range with available data
   useEffect(() => {
-    if (data.length > 0 && (!dateRange.start || !dateRange.end)) {
-      try {
-        const start = new Date(data[0].time).toISOString().split('T')[0];
-        const end = new Date(data[data.length - 1].time).toISOString().split('T')[0];
-        setDateRange({ start, end });
-      } catch (e) {
-        console.error("Date sync error", e);
+    // If no range is set, or we're in SIMULATED/FILES mode, sync with data bounds
+    if (data.length > 0) {
+      const actualStart = data[0].time.split('T')[0];
+      const actualEnd = data[data.length - 1].time.split('T')[0];
+      
+      // If no range exists or it's currently invalid for the dataset, reset to full bounds
+      if (!dateRange.start || !dateRange.end || dateRange.end < actualStart || dateRange.start > actualEnd) {
+        setDateRange({ start: actualStart, end: actualEnd });
       }
     }
-  }, [data, dateRange.start, dateRange.end]);
+  }, [data, dataSource]);
 
   const filteredData = useMemo(() => {
     if (data.length === 0) return [];
@@ -378,82 +565,153 @@ export default function App() {
     );
     
     setIsBacktesting(true);
+    setUploadStatus({
+      isUploading: true,
+      currentFile: '',
+      processedFiles: 0,
+      totalFiles: fileArray.length,
+      currentDateRange: '',
+      progress: 0
+    });
 
-    for (const file of fileArray) {
-      if (file.name.endsWith('.csv')) {
-        await new Promise<void>((resolve) => {
-          Papa.parse(file, {
-            header: true,
-            dynamicTyping: true,
-            complete: (results) => {
-              const parsed = results.data
-                .filter((d: any) => d && (d.time || d.Date || d.datetime))
-                .map((d: any) => ({
-                  time: d.time || d.Date || d.datetime,
-                  open: parseFloat(d.open || d.Open),
-                  high: parseFloat(d.high || d.High),
-                  low: parseFloat(d.low || d.Low),
-                  close: parseFloat(d.close || d.Close),
-                  volume: parseFloat(d.volume || d.Volume || 0)
-                }))
-                .filter((d: any) => !isNaN(d.open) && !isNaN(d.close));
-              allData.push(...parsed);
-              resolve();
-            }
+    for (let i = 0; i < fileArray.length; i++) {
+      const file = fileArray[i];
+      setUploadStatus(prev => ({ ...prev, currentFile: file.name, processedFiles: i }));
+      
+      let fileData: OHLCData[] = [];
+      try {
+        if (file.name.toLowerCase().endsWith('.csv')) {
+          fileData = await new Promise<OHLCData[]>((resolve) => {
+            Papa.parse(file, {
+              header: true,
+              skipEmptyLines: true,
+              dynamicTyping: true,
+              complete: (results) => {
+                const parsed = results.data
+                  .map((d: any) => {
+                    const rawTime = d.time || d.Time || d.Date || d.date || d.Timestamp || d.timestamp || d.DateTime || d.datetime;
+                    if (!rawTime) return null;
+                    
+                    // Try different date formats
+                    let date = new Date(rawTime);
+                    
+                    // If simple Date fails, try common Indian/Custom formats if needed
+                    // Actually standard ISO or most common strings work with new Date()
+                    if (isNaN(date.getTime())) {
+                        // Try splitting if it's like DD-MM-YYYY
+                        if (typeof rawTime === 'string' && rawTime.includes('-')) {
+                            const parts = rawTime.split(/[- :]/);
+                            if (parts[0].length === 2) { // DD-MM-YYYY
+                                date = new Date(`${parts[2]}-${parts[1]}-${parts[0]}T${parts[3] || '00'}:${parts[4] || '00'}:00`);
+                            }
+                        }
+                    }
+
+                    if (isNaN(date.getTime())) {
+                      console.warn(`Invalid date format for file ${file.name}: ${rawTime}`);
+                      return null;
+                    }
+
+                    const open = parseFloat(String(d.open || d.Open || '').replace(/,/g, ''));
+                    const close = parseFloat(String(d.close || d.Close || '').replace(/,/g, ''));
+                    if (isNaN(open) || isNaN(close)) return null;
+
+                    return {
+                      time: date.toISOString(),
+                      open,
+                      high: parseFloat(String(d.high || d.High || d.open || d.Open || '').replace(/,/g, '')),
+                      low: parseFloat(String(d.low || d.Low || d.close || d.Close || '').replace(/,/g, '')),
+                      close,
+                      volume: parseFloat(String(d.volume || d.Volume || 0).replace(/,/g, ''))
+                    };
+                  })
+                  .filter((d: any): d is OHLCData => d !== null);
+                resolve(parsed);
+              }
+            });
           });
-        });
-      } else {
-        // Handle Excel files
-        await new Promise<void>((resolve) => {
-          const reader = new FileReader();
-          reader.onload = (e) => {
-            const data = new Uint8Array(e.target?.result as ArrayBuffer);
-            const workbook = XLSX.read(data, { type: 'array' });
-            const firstSheetName = workbook.SheetNames[0];
-            const worksheet = workbook.Sheets[firstSheetName];
-            const jsonData = XLSX.utils.sheet_to_json(worksheet) as any[];
-            
-            const parsed = jsonData
-              .filter((d: any) => d && (d.time || d.Date || d.datetime))
-              .map((d: any) => ({
-                time: d.time || d.Date || d.datetime,
-                open: parseFloat(d.open || d.Open),
-                high: parseFloat(d.high || d.High),
-                low: parseFloat(d.low || d.Low),
-                close: parseFloat(d.close || d.Close),
-                volume: parseFloat(d.volume || d.Volume || 0)
-              }))
-              .filter((d: any) => !isNaN(d.open) && !isNaN(d.close));
-            allData.push(...parsed);
-            resolve();
-          };
-          reader.readAsArrayBuffer(file);
-        });
+        } else {
+          // Handle Excel files
+          fileData = await new Promise<OHLCData[]>((resolve) => {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+              const data = new Uint8Array(e.target?.result as ArrayBuffer);
+              const workbook = XLSX.read(data, { type: 'array' });
+              const firstSheetName = workbook.SheetNames[0];
+              const worksheet = workbook.Sheets[firstSheetName];
+              const jsonData = XLSX.utils.sheet_to_json(worksheet) as any[];
+              
+              const parsed = jsonData
+                .map((d: any) => {
+                  const rawTime = d.time || d.Time || d.Date || d.date || d.Timestamp || d.timestamp || d.DateTime || d.datetime;
+                  if (!rawTime) return null;
+                  let date = new Date(rawTime);
+                  
+                  if (isNaN(date.getTime())) return null;
+
+                  const open = parseFloat(String(d.open || d.Open || '').replace(/,/g, ''));
+                  const close = parseFloat(String(d.close || d.Close || '').replace(/,/g, ''));
+                  if (isNaN(open) || isNaN(close)) return null;
+
+                  return {
+                    time: date.toISOString(),
+                    open,
+                    high: parseFloat(String(d.high || d.High || d.open || d.Open || '').replace(/,/g, '')),
+                    low: parseFloat(String(d.low || d.Low || d.close || d.Close || '').replace(/,/g, '')),
+                    close,
+                    volume: parseFloat(String(d.volume || d.Volume || 0).replace(/,/g, ''))
+                  };
+                })
+                .filter((d: any): d is OHLCData => d !== null);
+              resolve(parsed);
+            };
+            reader.readAsArrayBuffer(file);
+          });
+        }
+      } catch (err) {
+        console.error(`Error parsing file ${file.name}`, err);
+      }
+      
+      if (fileData.length > 0) {
+        allData.push(...fileData);
+        if (user) {
+          await checkDuplicatesAndSave(fileData, file.name);
+        }
       }
     }
 
-    // Sort combined data by time
-    const sortedData = allData.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
-    
-      if (sortedData.length > 0) {
-        setData(sortedData);
-        setDataSource('FILES');
-        
-        // Auto-populate date range
-        try {
-          const start = new Date(sortedData[0].time).toISOString().split('T')[0];
-          const end = new Date(sortedData[sortedData.length - 1].time).toISOString().split('T')[0];
-          setDateRange({ start, end });
-        } catch (e) {
-          console.error("Could not parse dates for range auto-population", e);
-        }
+    // Combine with existing data if any
+    const finalData = dataSource === 'SIMULATED' ? allData : [...data, ...allData];
 
-        // Save to Firestore if user is logged in
-        if (user) {
-          saveDataToFirestore(sortedData);
-        }
+    // Sort combined data by time and remove duplicates
+    const sortedData = finalData.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+    
+    // De-duplicate by timestamp
+    const uniqueData: OHLCData[] = [];
+    const seenTimes = new Set<string>();
+    for (const d of sortedData) {
+      if (!seenTimes.has(d.time)) {
+        uniqueData.push(d);
+        seenTimes.add(d.time);
       }
+    }
+    
+    if (uniqueData.length > 0) {
+      setData(uniqueData);
+      setDataSource('FILES');
+      
+      // Auto-populate date range
+      try {
+        const start = uniqueData[0].time.split('T')[0];
+        const end = uniqueData[uniqueData.length - 1].time.split('T')[0];
+        setDateRange({ start, end });
+        console.log(`Successfully merged ${uniqueData.length} bars. Full Range: ${start} to ${end}`);
+      } catch (e) {
+        console.error("Date range auto-population failed", e);
+      }
+    }
     setIsBacktesting(false);
+    setUploadStatus(prev => ({ ...prev, isUploading: false }));
   };
 
   const handleRunBacktest = () => {
@@ -858,20 +1116,65 @@ export default function App() {
               </div>
             </div>
             <div className="h-8 w-px bg-slate-800" />
-            <div className="text-right">
-              <div className="text-[10px] text-slate-500 uppercase font-bold">Data Status</div>
-              <div className={cn(
-                "text-[9px] font-mono px-1.5 py-0.5 rounded border flex items-center gap-1.5",
-                dataSource === 'SIMULATED' ? "text-amber-500 border-amber-500/20 bg-amber-500/5" : 
-                dataSource === 'FILES' ? "text-emerald-500 border-emerald-500/20 bg-emerald-500/5" :
-                "text-blue-500 border-blue-500/20 bg-blue-500/5"
-              )}>
-                {dataSource}
-                {isSaving && <div className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse" />}
+            <div className="flex flex-col min-w-[80px]">
+              <label className="text-[9px] text-slate-500 uppercase font-bold">Data Status</label>
+              <div className="relative group">
+                <select 
+                  value={dataSource}
+                  onChange={(e) => {
+                    const val = e.target.value as any;
+                    setDataSource(val);
+                    if (val === 'DB') loadDataFromFirestore();
+                    if (val === 'SIMULATED') {
+                      // Trigger re-simulation if needed or clear data
+                      setData([]); 
+                    }
+                  }}
+                  className={cn(
+                    "w-full bg-slate-900 border appearance-none px-2 py-0.5 text-[9px] font-mono rounded outline-none cursor-pointer transition-all",
+                    dataSource === 'SIMULATED' ? "text-amber-500 border-amber-500/30 bg-amber-500/5 hover:border-amber-500/50" : 
+                    dataSource === 'FILES' ? "text-emerald-500 border-emerald-500/30 bg-emerald-500/5 hover:border-emerald-500/50" :
+                    "text-blue-500 border-blue-500/30 bg-blue-500/5 hover:border-blue-500/50"
+                  )}
+                >
+                  <option value="SIMULATED" className="bg-slate-900 text-amber-500">SIMULATED</option>
+                  <option value="FILES" className="bg-slate-900 text-emerald-500">FILES</option>
+                  <option value="DB" className="bg-slate-900 text-blue-500">DATABASE</option>
+                </select>
+                <div className="absolute right-1 top-1/2 -translate-y-1/2 pointer-events-none opacity-50">
+                  <Settings size={8} />
+                </div>
               </div>
+              {isSaving && <div className="mt-1 h-0.5 w-full bg-blue-500 animate-pulse rounded-full" />}
             </div>
           </div>
         </div>
+
+        {/* DB Error Alert */}
+        <AnimatePresence>
+          {dbError && (
+            <motion.div 
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              className="bg-rose-500/10 border-b border-rose-500/20 px-6 py-2 overflow-hidden"
+            >
+              <div className="max-w-7xl mx-auto flex items-center justify-between">
+                <div className="flex items-center gap-2 text-rose-400">
+                  <AlertCircle size={14} />
+                  <span className="text-[10px] font-bold uppercase tracking-wider">Database Error:</span>
+                  <span className="text-[10px] font-medium opacity-80">{dbError}</span>
+                </div>
+                <button 
+                  onClick={() => setDbError(null)}
+                  className="text-rose-400/50 hover:text-rose-400 transition-colors"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         {/* Visualization Area */}
         <div className="flex-1 relative bg-black/40 overflow-hidden flex flex-col">
@@ -1059,6 +1362,158 @@ export default function App() {
               <div className="p-4 border-t border-slate-800 text-center">
                 <button onClick={() => setShowFormulaModal(false)} className="px-6 py-2 bg-emerald-600 text-white text-[10px] font-bold rounded uppercase tracking-widest hover:bg-emerald-500 transition-colors">
                   I understand the logic
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Upload Status Popup */}
+      <AnimatePresence>
+        {uploadStatus.isUploading && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[110] flex items-center justify-center p-6 bg-black/40 backdrop-blur-[2px]"
+          >
+            <motion.div 
+              initial={{ scale: 0.9, y: 10 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.9, y: 10 }}
+              className="bg-[#1A1B22] border border-slate-700 w-full max-w-sm rounded-xl shadow-2xl overflow-hidden p-5 space-y-4"
+            >
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Database size={16} className={uploadStatus.error ? "text-rose-500" : "text-emerald-500"} />
+                  <h3 className="text-xs font-bold uppercase tracking-widest text-slate-200">
+                    {uploadStatus.error ? "Import Warning" : "Importing Data"}
+                  </h3>
+                </div>
+                {!uploadStatus.error && (
+                  <div className="text-[10px] font-mono text-slate-500">
+                    {uploadStatus.processedFiles} / {uploadStatus.totalFiles} Files
+                  </div>
+                )}
+                {uploadStatus.error && (
+                  <button 
+                    onClick={() => setUploadStatus(prev => ({ ...prev, isUploading: false, error: undefined }))}
+                    className="text-slate-500 hover:text-slate-300"
+                  >
+                    <X size={14} />
+                  </button>
+                )}
+              </div>
+
+              {uploadStatus.error ? (
+                <div className="bg-rose-500/10 border border-rose-500/20 p-4 rounded-lg space-y-2">
+                  <div className="flex items-center gap-2 text-rose-400 font-bold text-[10px] uppercase">
+                    <AlertCircle size={14} />
+                    <span>Quota Limit Reached</span>
+                  </div>
+                  <p className="text-[10px] text-slate-400 leading-normal">
+                    {uploadStatus.error}
+                  </p>
+                  <button 
+                    onClick={() => setUploadStatus(prev => ({ ...prev, isUploading: false, error: undefined }))}
+                    className="w-full mt-2 py-1.5 bg-rose-500/20 hover:bg-rose-500/30 text-rose-400 text-[9px] uppercase font-bold rounded border border-rose-500/30"
+                  >
+                    Continue Offline
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <div className="bg-slate-900 border border-slate-800 p-3 rounded-lg space-y-2">
+                     <div className="flex justify-between items-center">
+                       <span className="text-[10px] text-slate-500 uppercase font-bold">Current File</span>
+                       <span className="text-[10px] text-emerald-400 font-mono truncate max-w-[150px]">{uploadStatus.currentFile || 'Processing...'}</span>
+                     </div>
+                     <div className="flex justify-between items-center">
+                       <span className="text-[10px] text-slate-500 uppercase font-bold">Date Range</span>
+                       <span className="text-[10px] text-slate-400 font-mono">{uploadStatus.currentDateRange || 'Scanning...'}</span>
+                     </div>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <div className="flex justify-between text-[9px] font-bold uppercase tracking-tighter">
+                      <span className="text-slate-500">Upload Progress</span>
+                      <span className="text-emerald-500">{uploadStatus.progress}%</span>
+                    </div>
+                    <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                      <motion.div 
+                        className="h-full bg-emerald-500"
+                        initial={{ width: 0 }}
+                        animate={{ width: `${uploadStatus.progress}%` }}
+                        transition={{ type: 'spring', damping: 20, stiffness: 100 }}
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <p className="text-[9px] text-slate-600 italic text-center">
+                {uploadStatus.error ? "Free tier limits reset every 24 hours." : "Syncing with secure cloud database. Please do not close the tab."}
+              </p>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Overwrite Confirmation Modal */}
+      <AnimatePresence>
+        {showOverwriteModal && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[120] flex items-center justify-center p-6 bg-black/60 backdrop-blur-sm"
+          >
+            <motion.div 
+              initial={{ scale: 0.95, y: 20 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 20 }}
+              className="bg-[#1A1B22] border border-slate-700 w-full max-w-md rounded-xl shadow-2xl overflow-hidden p-6 space-y-6"
+            >
+              <div className="flex items-center gap-3 text-amber-500">
+                <AlertCircle size={24} />
+                <h3 className="text-sm font-bold uppercase tracking-wider text-slate-100">Data Conflict Detected</h3>
+              </div>
+              
+              <div className="space-y-3">
+                <p className="text-xs text-slate-400 leading-relaxed">
+                  The data range in <span className="text-emerald-400 font-mono">"{pendingImportData?.fileName}"</span> already exists in your database. 
+                </p>
+                <div className="bg-slate-900 border border-slate-800 p-3 rounded-lg text-[10px] space-y-1">
+                   <div className="flex justify-between">
+                     <span className="text-slate-500 uppercase font-bold">Conflict Range</span>
+                     <span className="text-slate-300 font-mono">
+                       {pendingImportData && pendingImportData.data.length > 0 && 
+                        `${new Date(pendingImportData.data[0].time).toLocaleDateString()} - ${new Date(pendingImportData.data[pendingImportData.data.length-1].time).toLocaleDateString()}`
+                       }
+                     </span>
+                   </div>
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <button 
+                  onClick={() => handleOverwriteDecision('OVERWRITE')}
+                  className="w-full py-2 bg-rose-600/20 hover:bg-rose-600/30 border border-rose-500/30 text-rose-400 text-[10px] font-bold rounded transition-all uppercase tracking-widest text-center"
+                >
+                  Overwrite (Delete existing, Add new)
+                </button>
+                <button 
+                  onClick={() => handleOverwriteDecision('MERGE')}
+                  className="w-full py-2 bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/30 text-emerald-400 text-[10px] font-bold rounded transition-all uppercase tracking-widest text-center"
+                >
+                  Add Additional (Merge data)
+                </button>
+                <button 
+                  onClick={() => handleOverwriteDecision('CANCEL')}
+                  className="w-full py-2 bg-slate-800 hover:bg-slate-700 text-slate-400 text-[10px] font-bold rounded transition-all uppercase tracking-widest"
+                >
+                  Skip this file
                 </button>
               </div>
             </motion.div>
